@@ -1,0 +1,22 @@
+# Unreal plugin build output (Alpakit / UBT regenerate these)
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.pdb
+*.obj
+*.lib
+*.exp
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.sln
+*.suo
+*.user
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

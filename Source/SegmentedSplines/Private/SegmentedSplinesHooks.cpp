@@ -13,11 +13,17 @@
 #include "Hologram/HologramHelpers.h"
 #include "Buildables/FGBuildablePole.h"
 #include "Buildables/FGBuildableConveyorBelt.h"
+#include "Buildables/FGBuildablePipeBase.h"
+#include "Buildables/FGBuildableRailroadTrack.h"
+#include "Buildables/FGBuildablePassthrough.h"
 #include "Equipment/FGBuildGun.h"
 #include "Equipment/FGBuildGunBuild.h"
 #include "FGCharacterPlayer.h"
 #include "FGConstructDisqualifier.h"
+#include "FGConnectionComponent.h"
 #include "FGFactoryConnectionComponent.h"
+#include "FGPipeConnectionComponent.h"
+#include "FGRailroadTrackConnectionComponent.h"
 #include "FGConstructionMessageInterface.h"
 
 #include "Components/SplineComponent.h"
@@ -36,59 +42,48 @@ bool FSegmentedSplinesHooks::sDriverBusy = false;
 // define it, so it does not link; the value comes from Config/DefaultEngine.ini ("BuildGun").
 static constexpr ECollisionChannel kBuildGunTraceChannel = ECC_GameTraceChannel5;
 
+static const FSegmentedSplinesHooks::FSplineKind kBeltKind  { FSegmentedSplinesHooks::ESplineKind::Belt,  TEXT( "belt" ),  true };
+static const FSegmentedSplinesHooks::FSplineKind kPipeKind  { FSegmentedSplinesHooks::ESplineKind::Pipe,  TEXT( "pipe" ),  true };
+static const FSegmentedSplinesHooks::FSplineKind kTrackKind { FSegmentedSplinesHooks::ESplineKind::Track, TEXT( "track" ), false };
+
 // ---------------------------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------------------------
 
+// One set of hooks per hologram class. SUBSCRIBE_UOBJECT_METHOD patches the vtable slot of the
+// given native class (via its CDO); Blueprint subclasses (the actual per-tier holograms) share
+// that native vtable, so one hook per C++ class covers every vanilla recipe. The hooked methods
+// are protected, which is why this class is a friend of each hologram class in
+// Config/AccessTransformers.ini: taking &Class::CheckValidPlacement is only legal from a friend.
+#define SS_HOOK_SPLINE_HOLOGRAM( HologramClass ) \
+	SUBSCRIBE_UOBJECT_METHOD( HologramClass, CheckValidPlacement, \
+		[]( auto& scope, HologramClass* self ) { OnCheckValidPlacement( self ); } ); \
+	SUBSCRIBE_UOBJECT_METHOD_AFTER( HologramClass, CheckValidPlacement, \
+		[]( HologramClass* self ) { OnAfterCheckValidPlacement( self ); } ); \
+	SUBSCRIBE_UOBJECT_METHOD( HologramClass, TrySnapToActor, \
+		[]( auto& scope, HologramClass* self, const FHitResult& hitResult ) { OnPlacementHit( self, hitResult ); } ); \
+	SUBSCRIBE_UOBJECT_METHOD( HologramClass, SetHologramLocationAndRotation, \
+		[]( auto& scope, HologramClass* self, const FHitResult& hitResult ) { OnPlacementHit( self, hitResult ); } ); \
+	SUBSCRIBE_UOBJECT_METHOD_AFTER( HologramClass, DoMultiStepPlacement, \
+		[]( bool bFinalStep, HologramClass* self, bool isInputFromARelease ) { OnAfterMultiStepPlacement( bFinalStep, self ); } );
+
 void FSegmentedSplinesHooks::RegisterHooks()
 {
-	// SUBSCRIBE_UOBJECT_METHOD patches the vtable slot of the given native class (via its CDO).
-	// Blueprint subclasses (the actual per-tier belt holograms) share that native vtable, so one
-	// hook per C++ hologram class covers every vanilla recipe.
-	//
-	// CheckValidPlacement is protected, which is why this class is declared a friend in
-	// Config/AccessTransformers.ini: taking &AFGConveyorBeltHologram::CheckValidPlacement is only
-	// legal from inside a friend.
-
-	// Belts: chain. Before vanilla validates we only bookkeep; after it validates we strike the
-	// "too long" verdict for a chainable hologram.
-	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, CheckValidPlacement,
-		[]( auto& scope, AFGConveyorBeltHologram* self )
-		{
-			OnBeltCheckValidPlacement( self );
-		} );
-	SUBSCRIBE_UOBJECT_METHOD_AFTER( AFGConveyorBeltHologram, CheckValidPlacement,
-		[]( AFGConveyorBeltHologram* self )
-		{
-			OnBeltAfterCheckValidPlacement( self );
-		} );
-
-	// Remember what the cursor hit when the belt's far end was placed. The build gun tries
-	// snapping first and only falls through to free placement if that fails, so both are hooked.
-	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, TrySnapToActor,
-		[]( auto& scope, AFGConveyorBeltHologram* self, const FHitResult& hitResult )
-		{
-			OnBeltPlacementHit( self, hitResult );
-		} );
-	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, SetHologramLocationAndRotation,
-		[]( auto& scope, AFGConveyorBeltHologram* self, const FHitResult& hitResult )
-		{
-			OnBeltPlacementHit( self, hitResult );
-		} );
-
-	// The moment the player builds. DoMultiStepPlacement returning true is the build gun accepting
-	// the click as the final step; it serialises and sends the hologram right after. For a chainable
-	// belt the hologram is reshaped into piece 0 in between, and the driver takes over the rest.
-	SUBSCRIBE_UOBJECT_METHOD_AFTER( AFGConveyorBeltHologram, DoMultiStepPlacement,
-		[]( bool bFinalStep, AFGConveyorBeltHologram* self, bool isInputFromARelease )
-		{
-			OnBeltAfterMultiStepPlacement( bFinalStep, self );
-		} );
+	// Before vanilla validates we only bookkeep; after it validates we strike the "too long"
+	// verdict for a chainable hologram. The two placement calls remember what the cursor hit when
+	// the far end was placed (the build gun tries snapping first and only falls through to free
+	// placement if that fails, so both are hooked). DoMultiStepPlacement returning true is the
+	// build gun accepting the click as the final step; it serialises and sends the hologram right
+	// after, and for a chainable hologram it is reshaped into piece 0 in between.
+	SS_HOOK_SPLINE_HOLOGRAM( AFGConveyorBeltHologram );
+	SS_HOOK_SPLINE_HOLOGRAM( AFGPipelineHologram );       // fluid pipes and hypertubes
+	SS_HOOK_SPLINE_HOLOGRAM( AFGRailroadTrackHologram );
 
 	// Fallback trigger and diagnostics: the serialisation itself. The function is introduced by
 	// IFGConstructionMessageInterface, so it is hooked through that type: the implementation is
 	// entered with the interface subobject as `this`, and a handler typed on AFGHologram would be
-	// handed a pointer 0x2b0 bytes into the object (SML logs that adjustment at install).
+	// handed a pointer 0x2b0 bytes into the object (SML logs that adjustment at install). None of
+	// the spline holograms override it, so the belt CDO resolves to the one shared implementation.
 	SUBSCRIBE_METHOD_VIRTUAL( IFGConstructionMessageInterface::SerializeConstructMessage,
 		static_cast< const IFGConstructionMessageInterface* >( GetDefault< AFGConveyorBeltHologram >() ),
 		[]( auto& scope, IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id )
@@ -104,94 +99,299 @@ void FSegmentedSplinesHooks::RegisterHooks()
 			OnBuildableFailedConstruction( self, id );
 		} );
 
-	SUBSCRIBE_UOBJECT_METHOD( AFGRailroadTrackHologram, CheckValidPlacement,
-		[]( auto& scope, AFGRailroadTrackHologram* self )
-		{
-			OnTrackCheckValidPlacement( self );
-		} );
-
-	// AFGPipelineHologram is used for fluid pipes. Hypertubes are expected to share it (both
-	// buildables derive from AFGBuildablePipeBase) but that is unverified: confirm in the editor by
-	// opening the hypertube's hologram class, and if it is a different class add a hook for it.
-	SUBSCRIBE_UOBJECT_METHOD( AFGPipelineHologram, CheckValidPlacement,
-		[]( auto& scope, AFGPipelineHologram* self )
-		{
-			OnPipelineCheckValidPlacement( self );
-		} );
-
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "Spline hologram hooks registered" ) );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "Spline hologram hooks registered (belts, pipes, tracks)" ) );
 }
 
+#undef SS_HOOK_SPLINE_HOLOGRAM
+
 // ---------------------------------------------------------------------------------------------
-// Belts: chain
+// Per-type knowledge
 // ---------------------------------------------------------------------------------------------
 
-FSegmentedSplinesHooks::FEndSupports FSegmentedSplinesHooks::GetBeltSupports( AFGConveyorBeltHologram* belt, int32 endIndex )
+const FSegmentedSplinesHooks::FSplineKind* FSegmentedSplinesHooks::FindKind( const AFGHologram* hologram )
 {
-	// Vanilla activates exactly one of the three per end depending on what the cursor hit
-	// (floor, wall, ceiling).
+	if( !hologram ) return nullptr;
+	if( hologram->IsA< AFGConveyorBeltHologram >() )  return &kBeltKind;
+	if( hologram->IsA< AFGPipelineHologram >() )      return &kPipeKind;
+	if( hologram->IsA< AFGRailroadTrackHologram >() ) return &kTrackKind;
+	return nullptr;
+}
+
+UClass* FSegmentedSplinesHooks::KindTooLongDisqualifier( const FSplineKind* kind )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:  return UFGCDConveyorTooLong::StaticClass();
+	case ESplineKind::Pipe:  return UFGCDPipeTooLong::StaticClass();
+	case ESplineKind::Track: return UFGCDTrackTooLong::StaticClass();
+	}
+	return nullptr;
+}
+
+float FSegmentedSplinesHooks::KindMaxLength( const FSplineKind* kind, const AFGSplineHologram* hologram )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:  return static_cast< const AFGConveyorBeltHologram* >( hologram )->mMaxSplineLength;
+	case ESplineKind::Pipe:  return static_cast< const AFGPipelineHologram* >( hologram )->mMaxSplineLength;
+	// Set per recipe in the hologram's Blueprint defaults (no C++ default).
+	case ESplineKind::Track: return static_cast< const AFGRailroadTrackHologram* >( hologram )->mMaxLength;
+	}
+	return 0.f;
+}
+
+FSegmentedSplinesHooks::FEndSupports FSegmentedSplinesHooks::KindSupports( const FSplineKind* kind, AFGSplineHologram* hologram, int32 endIndex )
+{
+	// Vanilla activates at most one of these per end depending on what the cursor hit
+	// (floor, wall, ceiling). Tracks have no supports.
 	FEndSupports supports;
-	supports.Pole = belt->mChildPoleHologram[ endIndex ].Get();
-	supports.Mounts.Add( belt->mChildWallPoleHologram[ endIndex ].Get() );
-	supports.Mounts.Add( belt->mChildCeilingPoleHologram[ endIndex ].Get() );
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+	{
+		AFGConveyorBeltHologram* belt = static_cast< AFGConveyorBeltHologram* >( hologram );
+		supports.Pole = belt->mChildPoleHologram[ endIndex ].Get();
+		supports.Mounts.Add( belt->mChildWallPoleHologram[ endIndex ].Get() );
+		supports.Mounts.Add( belt->mChildCeilingPoleHologram[ endIndex ].Get() );
+		break;
+	}
+	case ESplineKind::Pipe:
+	{
+		AFGPipelineHologram* pipe = static_cast< AFGPipelineHologram* >( hologram );
+		supports.Pole = pipe->mChildPoleHologram[ endIndex ].Get();
+		supports.Mounts.Add( pipe->mChildWallPoleHologram[ endIndex ].Get() );
+		break;
+	}
+	case ESplineKind::Track:
+		break;
+	}
 	return supports;
 }
 
-bool FSegmentedSplinesHooks::IsChainCandidate( AFGConveyorBeltHologram* belt, bool bRequireDragStep )
+void FSegmentedSplinesHooks::KindSnapStart( const FSplineKind* kind, AFGSplineHologram* hologram, UFGConnectionComponent* joint )
 {
-	if( !belt || sDriverBusy || !belt->IsLocalHologram() )
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+	{
+		AFGConveyorBeltHologram* belt = static_cast< AFGConveyorBeltHologram* >( hologram );
+		belt->mSnappedConnectionComponents[ 0 ] = Cast< UFGFactoryConnectionComponent >( joint );
+		belt->mSnappedWallPassthrough[ 0 ] = nullptr;
+		// Flow direction follows from what the start is snapped to (an output feeds this piece, an
+		// input is fed by it); this is vanilla's own routine for that.
+		belt->SetupSnappedConnectionDirections();
+		break;
+	}
+	case ESplineKind::Pipe:
+	{
+		AFGPipelineHologram* pipe = static_cast< AFGPipelineHologram* >( hologram );
+		pipe->mSnappedConnectionComponents[ 0 ] = Cast< UFGPipeConnectionComponentBase >( joint );
+		// Wall holes the player's hologram went through belong to the player's piece, not this one.
+		pipe->mSnappedPassthroughs.Reset();
+		break;
+	}
+	case ESplineKind::Track:
+	{
+		AFGRailroadTrackHologram* track = static_cast< AFGRailroadTrackHologram* >( hologram );
+		UFGRailroadTrackConnectionComponent* connection = Cast< UFGRailroadTrackConnectionComponent >( joint );
+		track->mSnappedRailroadTrack = nullptr;
+		// Vanilla's own start snap, given the cursor location a player would have aimed at: it records
+		// the connection plus the start location/tangent and switch-control state that go with it.
+		const FVector location = connection ? connection->GetConnectorLocation() : FVector::ZeroVector;
+		const bool vanillaSnapped = connection && track->TryFindAndSnapToOverlappingConnection( 0, location )
+			&& track->mSnappedConnectionComponents[ 0 ] == connection;
+		if( !vanillaSnapped )
+		{
+			track->mSnappedConnectionComponents[ 0 ] = connection;
+			track->mSnappedStartLocation = location;
+			track->mSnappedStartTangent = connection ? connection->GetConnectorNormal() : FVector::ForwardVector;
+		}
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] track start snapped %s" ), vanillaSnapped ? TEXT( "by vanilla's overlap snap" ) : TEXT( "by hand" ) );
+		break;
+	}
+	}
+}
+
+void FSegmentedSplinesHooks::KindClearEndSnap( const FSplineKind* kind, AFGSplineHologram* hologram )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+	{
+		AFGConveyorBeltHologram* belt = static_cast< AFGConveyorBeltHologram* >( hologram );
+		belt->mSnappedConnectionComponents[ 1 ] = nullptr;
+		belt->mSnappedWallPassthrough[ 1 ] = nullptr;
+		break;
+	}
+	case ESplineKind::Pipe:
+	{
+		AFGPipelineHologram* pipe = static_cast< AFGPipelineHologram* >( hologram );
+		pipe->mSnappedConnectionComponents[ 1 ] = nullptr;
+		// The passthrough list does not say which end each wall hole belongs to; keep the ones at
+		// the start (the player's own) and drop any other, which can only have been at the far end.
+		const FVector startWorld = hologram->GetActorTransform().TransformPosition( hologram->mSplineData[ 0 ].Location );
+		pipe->mSnappedPassthroughs.RemoveAll( [ & ]( const TObjectPtr< AFGBuildablePassthrough >& passthrough )
+		{
+			return !passthrough || FVector::Dist( passthrough->GetActorLocation(), startWorld ) > 600.f;
+		} );
+		break;
+	}
+	case ESplineKind::Track:
+	{
+		AFGRailroadTrackHologram* track = static_cast< AFGRailroadTrackHologram* >( hologram );
+		track->mSnappedConnectionComponents[ 1 ] = nullptr;
+		track->mUseCustomEndRotation = false;
+		break;
+	}
+	}
+}
+
+void FSegmentedSplinesHooks::KindOnSplineReplaced( const FSplineKind* kind, AFGSplineHologram* hologram )
+{
+	if( kind->Type != ESplineKind::Track )
+	{
+		return;
+	}
+	// A track keeps one floor sample per spline point (local space; its CDO starts with two of
+	// each). Keep the two arrays the same length: the floor under each point if there is one in
+	// reach, else the point itself.
+	AFGRailroadTrackHologram* track = static_cast< AFGRailroadTrackHologram* >( hologram );
+	const FTransform frame = hologram->GetActorTransform();
+	UWorld* world = hologram->GetWorld();
+	FCollisionQueryParams params( SCENE_QUERY_STAT( SegmentedSplinesTrackFloor ), false );
+	params.AddIgnoredActor( hologram );
+	for( AFGHologram* child : hologram->GetHologramChildren() )
+	{
+		if( child ) params.AddIgnoredActor( child );
+	}
+	track->mFloorData.SetNum( track->mSplineData.Num() );
+	for( int32 i = 0; i < track->mSplineData.Num(); ++i )
+	{
+		const FVector pointWorld = frame.TransformPosition( track->mSplineData[ i ].Location );
+		FVector floorWorld = pointWorld;
+		FHitResult hit;
+		if( world && world->LineTraceSingleByChannel( hit, pointWorld + FVector( 0.f, 0.f, kTraceStartLift ),
+			pointWorld - FVector( 0.f, 0.f, kFallbackMaxPoleHeight ), kBuildGunTraceChannel, params ) )
+		{
+			floorWorld = hit.ImpactPoint;
+		}
+		track->mFloorData[ i ] = frame.InverseTransformPosition( floorWorld );
+	}
+}
+
+void FSegmentedSplinesHooks::KindForEachBuildable( const FSplineKind* kind, UWorld* world, TFunctionRef< bool( AFGBuildable* ) > visit )
+{
+	if( !world ) return;
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+		for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it ) { if( !visit( *it ) ) return; }
+		break;
+	case ESplineKind::Pipe:
+		for( TActorIterator< AFGBuildablePipeBase > it( world ); it; ++it ) { if( !visit( *it ) ) return; }
+		break;
+	case ESplineKind::Track:
+		for( TActorIterator< AFGBuildableRailroadTrack > it( world ); it; ++it ) { if( !visit( *it ) ) return; }
+		break;
+	}
+}
+
+UFGConnectionComponent* FSegmentedSplinesHooks::KindConnection( const FSplineKind* kind, AFGBuildable* buildable, int32 index )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+	{
+		AFGBuildableConveyorBelt* belt = Cast< AFGBuildableConveyorBelt >( buildable );
+		return belt ? ( index == 0 ? belt->GetConnection0() : belt->GetConnection1() ) : nullptr;
+	}
+	case ESplineKind::Pipe:
+	{
+		AFGBuildablePipeBase* pipe = Cast< AFGBuildablePipeBase >( buildable );
+		return pipe ? ( index == 0 ? pipe->GetConnection0() : pipe->GetConnection1() ) : nullptr;
+	}
+	case ESplineKind::Track:
+	{
+		AFGBuildableRailroadTrack* track = Cast< AFGBuildableRailroadTrack >( buildable );
+		return track ? track->GetConnection( index ) : nullptr;
+	}
+	}
+	return nullptr;
+}
+
+FVector FSegmentedSplinesHooks::KindConnectorLocation( const FSplineKind* kind, UFGConnectionComponent* connection )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:  return static_cast< UFGFactoryConnectionComponent* >( connection )->GetConnectorLocation();
+	case ESplineKind::Pipe:  return static_cast< UFGPipeConnectionComponentBase* >( connection )->GetConnectorLocation();
+	case ESplineKind::Track: return static_cast< UFGRailroadTrackConnectionComponent* >( connection )->GetConnectorLocation();
+	}
+	return connection->GetComponentLocation();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------------------------
+
+bool FSegmentedSplinesHooks::IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep )
+{
+	if( !hologram || !kind || sDriverBusy || !hologram->IsLocalHologram() )
 	{
 		return false;
 	}
-	const ESplineHologramBuildStep step = belt->GetCurrentBuildStep();
+	const ESplineHologramBuildStep step = hologram->GetCurrentBuildStep();
 	if( bRequireDragStep && step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding && step != ESplineHologramBuildStep::SHBS_AdjustPole )
 	{
 		return false;
 	}
-	if( !belt->mSplineComponent || belt->mSplineData.Num() < 2 || belt->mMaxSplineLength <= 0.f )
+	const float maxLength = KindMaxLength( kind, hologram );
+	if( !hologram->mSplineComponent || hologram->mSplineData.Num() < 2 || maxLength <= 0.f )
 	{
 		return false;
 	}
-	const float length = belt->mSplineComponent->GetSplineLength();
-	if( length <= belt->mMaxSplineLength )
+	const float length = hologram->mSplineComponent->GetSplineLength();
+	if( length <= maxLength )
 	{
 		return false;
 	}
-	const int32 pieces = FMath::CeilToInt( length / ( belt->mMaxSplineLength - kSafetyMargin ) );
+	const int32 pieces = FMath::CeilToInt( length / ( maxLength - kSafetyMargin ) );
 	return pieces <= kMaxChainPieces;
 }
 
-void FSegmentedSplinesHooks::OnBeltCheckValidPlacement( AFGConveyorBeltHologram* self )
+void FSegmentedSplinesHooks::OnCheckValidPlacement( AFGSplineHologram* self )
 {
-	if( !self || sDriverBusy || !self->IsLocalHologram() )
+	const FSplineKind* kind = FindKind( self );
+	if( !kind || sDriverBusy || !self->IsLocalHologram() )
 	{
 		return;
 	}
-	// A belt back within the limit after a chain preview gets vanilla's own support choice again.
+	// A hologram back within the limit after a chain preview gets vanilla's own support choice again.
 	if( self->GetCurrentBuildStep() == ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding
-		&& self->mSplineComponent && self->mSplineComponent->GetSplineLength() <= self->mMaxSplineLength )
+		&& self->mSplineComponent && self->mSplineComponent->GetSplineLength() <= KindMaxLength( kind, self ) )
 	{
-		RestoreSupports( GetBeltSupports( self, 1 ) );
+		RestoreSupports( KindSupports( kind, self, 1 ) );
 	}
 }
 
-void FSegmentedSplinesHooks::OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self )
+void FSegmentedSplinesHooks::OnAfterCheckValidPlacement( AFGSplineHologram* self )
 {
-	if( !IsChainCandidate( self, true ) )
+	const FSplineKind* kind = FindKind( self );
+	if( !IsChainCandidate( self, kind, true ) )
 	{
 		return;
 	}
 	// Vanilla has just judged the full curve too long. Every piece we will send is under the limit,
 	// so that verdict does not apply; everything else it found (clearance, cost, snapping) stands.
-	const int32 removed = self->mConstructDisqualifiers.Remove( UFGCDConveyorTooLong::StaticClass() );
+	const int32 removed = self->mConstructDisqualifiers.Remove( KindTooLongDisqualifier( kind ) );
 	if( removed > 0 )
 	{
-		UE_LOG( LogSegmentedSplines, VeryVerbose, TEXT( "[belt] %.0f cm hologram over the %.0f limit, chainable: cleared TooLong" ),
-			self->mSplineComponent->GetSplineLength(), self->mMaxSplineLength );
+		UE_LOG( LogSegmentedSplines, VeryVerbose, TEXT( "[%s] %.0f cm hologram over the %.0f limit, chainable: cleared TooLong" ),
+			kind->Name, self->mSplineComponent->GetSplineLength(), KindMaxLength( kind, self ) );
 	}
 }
 
-void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, const FHitResult& hit )
+void FSegmentedSplinesHooks::OnPlacementHit( AFGSplineHologram* self, const FHitResult& hit )
 {
 	if( self && !sDriverBusy && self->IsLocalHologram() )
 	{
@@ -199,39 +399,41 @@ void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, 
 	}
 }
 
-void FSegmentedSplinesHooks::OnBeltAfterMultiStepPlacement( bool bFinalStep, AFGConveyorBeltHologram* self )
+void FSegmentedSplinesHooks::OnAfterMultiStepPlacement( bool bFinalStep, AFGSplineHologram* self )
 {
-	if( !self || !self->IsLocalHologram() )
+	const FSplineKind* kind = FindKind( self );
+	if( !kind || !self->IsLocalHologram() )
 	{
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)%s" ),
-		bFinalStep ? TEXT( "final" ) : TEXT( "more steps" ), static_cast< int32 >( self->GetCurrentBuildStep() ),
-		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, self->mMaxSplineLength,
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)%s" ),
+		kind->Name, bFinalStep ? TEXT( "final" ) : TEXT( "more steps" ), static_cast< int32 >( self->GetCurrentBuildStep() ),
+		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, KindMaxLength( kind, self ),
 		sDriverBusy ? TEXT( " [driver]" ) : TEXT( "" ) );
 	if( bFinalStep && !sDriverBusy )
 	{
-		StartChain( self, TEXT( "DoMultiStepPlacement" ) );
+		StartChain( self, kind, TEXT( "DoMultiStepPlacement" ) );
 	}
 }
 
 void FSegmentedSplinesHooks::OnSerializeConstructMessage( IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id )
 {
-	AFGConveyorBeltHologram* belt = Cast< AFGConveyorBeltHologram >( self );
-	if( !belt )
+	AFGSplineHologram* hologram = Cast< AFGSplineHologram >( self );
+	const FSplineKind* kind = FindKind( hologram );
+	if( !kind )
 	{
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] SerializeConstructMessage %s id=%s, step %d, length %.0f, local %d, driver busy %d" ),
-		ar.IsSaving() ? TEXT( "saving" ) : TEXT( "loading" ), *id.ToString(), static_cast< int32 >( belt->GetCurrentBuildStep() ),
-		belt->mSplineComponent ? belt->mSplineComponent->GetSplineLength() : -1.f, belt->IsLocalHologram() ? 1 : 0, sDriverBusy ? 1 : 0 );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s SerializeConstructMessage %s id=%s, step %d, length %.0f, local %d, driver busy %d" ),
+		kind->Name, ar.IsSaving() ? TEXT( "saving" ) : TEXT( "loading" ), *id.ToString(), static_cast< int32 >( hologram->GetCurrentBuildStep() ),
+		hologram->mSplineComponent ? hologram->mSplineComponent->GetSplineLength() : -1.f, hologram->IsLocalHologram() ? 1 : 0, sDriverBusy ? 1 : 0 );
 	// Loading happens on the server and on the client's pending-construction copy; neither is ours.
 	if( ar.IsSaving() && !sDriverBusy )
 	{
-		StartChain( belt, TEXT( "SerializeConstructMessage" ) );
+		StartChain( hologram, kind, TEXT( "SerializeConstructMessage" ) );
 	}
 	// The client serialises twice per build: once with an empty ID to make its pending copy, then
-	// with the real ID for the server. The built belt replicates back carrying that ID.
+	// with the real ID for the server. The built actor replicates back carrying that ID.
 	if( ar.IsSaving() && sChain && id.NetPlayerID >= 0 )
 	{
 		sChain->PendingId = id;
@@ -240,11 +442,31 @@ void FSegmentedSplinesHooks::OnSerializeConstructMessage( IFGConstructionMessage
 	}
 }
 
-void FSegmentedSplinesHooks::StartChain( AFGConveyorBeltHologram* belt, const TCHAR* trigger )
+void FSegmentedSplinesHooks::OnBuildableFailedConstruction( UFGBuildGunStateBuild* self, FNetConstructionID id )
+{
+	if( !sChain || !sChain->bWaiting )
+	{
+		return;
+	}
+	const bool bOurs = !sChain->bHasPendingId
+		|| ( id.NetPlayerID == sChain->PendingId.NetPlayerID && id.Client_ID == sChain->PendingId.Client_ID );
+	UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] server refused construction %s while waiting for piece %d of %d%s" ),
+		*id.ToString(), sChain->NextPiece, sChain->Pieces.Num(), bOurs ? TEXT( "" ) : TEXT( " (a different build; ignored)" ) );
+	if( bOurs )
+	{
+		AbortChain( TEXT( "the server rejected the piece" ) );
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chain driver
+// ---------------------------------------------------------------------------------------------
+
+void FSegmentedSplinesHooks::StartChain( AFGSplineHologram* hologram, const FSplineKind* kind, const TCHAR* trigger )
 {
 	// At build time the step no longer matters; only the length does. Once piece 0 is in place
-	// the belt is under the limit, so a second trigger for the same build is a no-op.
-	if( !IsChainCandidate( belt, false ) )
+	// the hologram is under the limit, so a second trigger for the same build is a no-op.
+	if( !IsChainCandidate( hologram, kind, false ) )
 	{
 		return;
 	}
@@ -252,16 +474,16 @@ void FSegmentedSplinesHooks::StartChain( AFGConveyorBeltHologram* belt, const TC
 	{
 		AbortChain( TEXT( "a new build started while a chain was still running" ) );
 	}
-	UFGBuildGunStateBuild* buildState = FindBuildState( belt );
+	UFGBuildGunStateBuild* buildState = FindBuildState( hologram );
 	if( !buildState )
 	{
-		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] could not find the build gun's build state; sending the full belt as vanilla would" ) );
+		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] could not find the build gun's build state; sending the full %s as vanilla would" ), kind->Name );
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] build accepted (%s), reshaping into piece 1" ), trigger );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s build accepted (%s), reshaping into piece 1" ), kind->Name, trigger );
 	// While the hologram is reshaped and re-validated the placement hooks stand aside.
 	sDriverBusy = true;
-	PlanChain( belt, buildState );
+	PlanChain( hologram, kind, buildState );
 	sDriverBusy = false;
 }
 
@@ -272,20 +494,22 @@ UFGBuildGunStateBuild* FSegmentedSplinesHooks::FindBuildState( AFGHologram* holo
 	return buildGun ? Cast< UFGBuildGunStateBuild >( buildGun->GetBuildGunStateFor( EBuildGunState::BGS_BUILD ) ) : nullptr;
 }
 
-bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState )
+bool FSegmentedSplinesHooks::PlanChain( AFGSplineHologram* hologram, const FSplineKind* kind, UFGBuildGunStateBuild* buildState )
 {
-	USplineComponent* spline = belt->mSplineComponent;
-	const float maxLength = belt->mMaxSplineLength;
+	USplineComponent* spline = hologram->mSplineComponent;
+	const float maxLength = KindMaxLength( kind, hologram );
 	const float totalLength = spline->GetSplineLength();
 	const int32 numPieces = FMath::CeilToInt( totalLength / ( maxLength - kSafetyMargin ) );
 	const float pieceLength = totalLength / numPieces;
 
 	TUniquePtr< FChainPlan > plan = MakeUnique< FChainPlan >();
+	plan->Kind = kind;
 	plan->BuildState = buildState;
-	plan->World = belt->GetWorld();
-	plan->Recipe = belt->GetRecipe();
-	plan->Frame = belt->GetActorTransform();
-	if( const FHitResult* hit = sLastHit.Find( belt ) )
+	plan->World = hologram->GetWorld();
+	plan->Recipe = hologram->GetRecipe();
+	plan->Frame = hologram->GetActorTransform();
+	plan->FinalStep = hologram->GetCurrentBuildStep();
+	if( const FHitResult* hit = sLastHit.Find( hologram ) )
 	{
 		plan->EndHit = *hit;
 		plan->bHasEndHit = true;
@@ -293,27 +517,21 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 
 	// Cut the curve into equal pieces. The game's splitter works on a spline component, so the
 	// hologram's own component is reused for each remainder and put back on piece 0 at the end.
-	TArray< FSplinePointData > remaining = belt->mSplineData;
+	const TArray< FSplinePointData > original = hologram->mSplineData;
+	TArray< FSplinePointData > remaining = original;
 	for( int32 i = 0; i < numPieces - 1; ++i )
 	{
-		belt->mSplineData = remaining;
-		belt->UpdateSplineComponent();
+		SetSplineData( hologram, kind, CopyTemp( remaining ) );
 		TArray< FSplinePointData > first;
 		TArray< FSplinePointData > rest;
 		FSplineUtils::SplitSplineAtDistance( spline, pieceLength, first, rest );
 		if( first.Num() < 2 || rest.Num() < 2 )
 		{
-			belt->mSplineData = remaining;
-			belt->UpdateSplineComponent();
+			SetSplineData( hologram, kind, CopyTemp( original ) );
 			UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] split %d of %d produced %d + %d points, building vanilla's way" ), i + 1, numPieces, first.Num(), rest.Num() );
 			return false;
 		}
-		if( !MakeContinuous( rest, first.Last().Location, *FString::Printf( TEXT( "split %d" ), i + 1 ) ) )
-		{
-			belt->mSplineData = remaining;
-			belt->UpdateSplineComponent();
-			return false;
-		}
+		MakeContinuous( rest, first.Last().Location, *FString::Printf( TEXT( "split %d" ), i + 1 ) );
 		plan->Pieces.Add( MoveTemp( first ) );
 		remaining = MoveTemp( rest );
 	}
@@ -328,21 +546,16 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 			*plan->Pieces[ i ][ 0 ].Location.ToString(), *plan->Pieces[ i ].Last().Location.ToString() );
 	}
 
-	// Piece 0 keeps the player's start (its snap and start pole are already vanilla's) and gets a
-	// joint at its far end: no snap, no mount, a pole only if there is a floor under it.
-	ApplyPiece( belt, plan->Pieces[ 0 ] );
-	belt->mSnappedConnectionComponents[ 1 ] = nullptr;
-	belt->mSnappedWallPassthrough[ 1 ] = nullptr;
-	const FVector endWorld = plan->Frame.TransformPosition( belt->mSplineData.Last().Location );
-	SeatOrDisableEndPole( belt, maxLength - kSafetyMargin, GetBeltSupports( belt, 1 ), endWorld, 0.f, false, TEXT( "chain piece 1" ) );
-	ValidateForConstruction( belt );
-	if( !belt->CanConstruct() )
+	// Piece 0 keeps the player's start (its snap and start support are already vanilla's) and gets
+	// a joint at its far end: no snap, no mount, a pole only if there is a floor under it.
+	ApplyPiece( hologram, kind, plan->Pieces[ 0 ] );
+	KindClearEndSnap( kind, hologram );
+	SeatOrDisableEndPole( hologram, kind, maxLength - kSafetyMargin, KindSupports( kind, hologram, 1 ), TEXT( "chain piece 1" ) );
+	ValidateForConstruction( hologram );
+	if( !hologram->CanConstruct() )
 	{
-		TArray< TSubclassOf< UFGConstructDisqualifier > > why;
-		belt->GetConstructDisqualifiers( why );
-		FString names;
-		for( auto& d : why ) names += ( d ? d->GetName() : TEXT( "null" ) ) + TEXT( " " );
-		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] piece 1 of %d is not constructible (%s); building it anyway so vanilla reports why" ), numPieces, *names );
+		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] piece 1 of %d is not constructible (%s); building it anyway so vanilla reports why" ),
+			numPieces, *DisqualifierNames( hologram ) );
 	}
 
 	plan->NextPiece = 1;
@@ -350,7 +563,7 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 	plan->WaitStart = plan->Pieces[ 0 ][ 0 ].Location;
 	plan->WaitEnd = plan->Pieces[ 0 ].Last().Location;
 	plan->SentAt = FPlatformTime::Seconds();
-	SnapshotBelts( *plan, belt->GetWorld() );
+	SnapshotBuildables( *plan, hologram->GetWorld() );
 	sChain = MoveTemp( plan );
 
 	if( !sTicker.IsValid() )
@@ -358,19 +571,28 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 		sTicker = FTSTicker::GetCoreTicker().AddTicker( FTickerDelegate::CreateStatic( &FSegmentedSplinesHooks::TickChain ) );
 	}
 
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %.0f cm belt -> %d pieces of %.0f cm (limit %.0f); piece 1 goes with the player's build" ),
-		totalLength, numPieces, pieceLength, maxLength );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %.0f cm %s -> %d pieces of %.0f cm (limit %.0f); piece 1 goes with the player's build" ),
+		totalLength, kind->Name, numPieces, pieceLength, maxLength );
 	return true;
 }
 
-void FSegmentedSplinesHooks::ValidateForConstruction( AFGConveyorBeltHologram* belt )
+void FSegmentedSplinesHooks::ValidateForConstruction( AFGHologram* hologram )
 {
 	UFGInventoryComponent* inventory = nullptr;
-	if( AFGCharacterPlayer* player = Cast< AFGCharacterPlayer >( belt->GetConstructionInstigator() ) )
+	if( AFGCharacterPlayer* player = Cast< AFGCharacterPlayer >( hologram->GetConstructionInstigator() ) )
 	{
 		inventory = player->GetInventory();
 	}
-	belt->ValidatePlacementAndCost( inventory );
+	hologram->ValidatePlacementAndCost( inventory );
+}
+
+FString FSegmentedSplinesHooks::DisqualifierNames( AFGHologram* hologram )
+{
+	TArray< TSubclassOf< UFGConstructDisqualifier > > why;
+	hologram->GetConstructDisqualifiers( why );
+	FString names;
+	for( auto& d : why ) names += ( d ? d->GetName() : TEXT( "null" ) ) + TEXT( " " );
+	return names;
 }
 
 void FSegmentedSplinesHooks::ToWorld( const FTransform& frame, TArray< FSplinePointData >& points )
@@ -383,7 +605,7 @@ void FSegmentedSplinesHooks::ToWorld( const FTransform& frame, TArray< FSplinePo
 	}
 }
 
-bool FSegmentedSplinesHooks::MakeContinuous( TArray< FSplinePointData >& piece, const FVector& expectedStart, const TCHAR* what )
+void FSegmentedSplinesHooks::MakeContinuous( TArray< FSplinePointData >& piece, const FVector& expectedStart, const TCHAR* what )
 {
 	// The splitter's second half is relative to the split point: its first point is at the local
 	// origin (confirmed in-game). Move it so that it starts at the split point. It must never be
@@ -400,30 +622,38 @@ bool FSegmentedSplinesHooks::MakeContinuous( TArray< FSplinePointData >& piece, 
 		}
 	}
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half started %.0f cm from the split point, translated onto it" ), what, startGap );
-	return true;
 }
 
-void FSegmentedSplinesHooks::ApplyPiece( AFGConveyorBeltHologram* hologram, const TArray< FSplinePointData >& worldPiece )
+void FSegmentedSplinesHooks::SetSplineData( AFGSplineHologram* hologram, const FSplineKind* kind, TArray< FSplinePointData >&& localPoints )
+{
+	hologram->mSplineData = MoveTemp( localPoints );
+	KindOnSplineReplaced( kind, hologram );
+	// Rebuild the visual spline, spline meshes and clearance from the new data, exactly as the
+	// hologram does after routing. Vanilla's validation measures mSplineComponent.
+	hologram->UpdateSplineComponent();
+}
+
+void FSegmentedSplinesHooks::ApplyPiece( AFGSplineHologram* hologram, const FSplineKind* kind, const TArray< FSplinePointData >& worldPiece )
 {
 	const FTransform frame = hologram->GetActorTransform();
-	hologram->mSplineData = worldPiece;
-	for( FSplinePointData& point : hologram->mSplineData )
+	TArray< FSplinePointData > local = worldPiece;
+	for( FSplinePointData& point : local )
 	{
 		point.Location = frame.InverseTransformPosition( point.Location );
 		point.ArriveTangent = frame.InverseTransformVector( point.ArriveTangent );
 		point.LeaveTangent = frame.InverseTransformVector( point.LeaveTangent );
 	}
-	hologram->UpdateSplineComponent();
+	SetSplineData( hologram, kind, MoveTemp( local ) );
 }
 
-void FSegmentedSplinesHooks::SnapshotBelts( FChainPlan& plan, UWorld* world )
+void FSegmentedSplinesHooks::SnapshotBuildables( FChainPlan& plan, UWorld* world )
 {
-	plan.KnownBelts.Reset();
-	if( !world ) return;
-	for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
+	plan.Known.Reset();
+	KindForEachBuildable( plan.Kind, world, [ &plan ]( AFGBuildable* buildable )
 	{
-		plan.KnownBelts.Add( *it );
-	}
+		plan.Known.Add( buildable );
+		return true;
+	} );
 }
 
 bool FSegmentedSplinesHooks::TickChain( float deltaTime )
@@ -434,6 +664,7 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 		return false;
 	}
 	FChainPlan& plan = *sChain;
+	const FSplineKind* kind = plan.Kind;
 	UWorld* world = plan.World.Get();
 	if( !world || !plan.BuildState.IsValid() )
 	{
@@ -443,52 +674,51 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 
 	if( plan.bWaiting )
 	{
-		// The server builds the piece and replicates the belt back. It carries the construction ID
+		// The server builds the piece and replicates the actor back. It carries the construction ID
 		// the client sent (replicated); failing that, match it by its ends.
-		for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
+		KindForEachBuildable( kind, world, [ & ]( AFGBuildable* candidate )
 		{
-			AFGBuildableConveyorBelt* candidate = *it;
-			// Client IDs restart every launch, so a belt from an earlier session can carry the same
-			// ID; only a belt that did not exist when the piece was sent can be the piece.
-			if( plan.KnownBelts.Contains( candidate ) )
+			// Client IDs restart every launch, so an actor from an earlier session can carry the same
+			// ID; only one that did not exist when the piece was sent can be the piece.
+			if( plan.Known.Contains( candidate ) )
 			{
-				continue;
+				return true;
 			}
-			UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
-			UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
+			UFGConnectionComponent* c0 = KindConnection( kind, candidate, 0 );
+			UFGConnectionComponent* c1 = KindConnection( kind, candidate, 1 );
 			if( !c0 || !c1 )
 			{
-				continue;
+				return true;
 			}
 			// A belt stores its spline in flow direction (connection0 = input, connection1 = output).
 			// When the player drags against the flow, the server reverses the points, so the joint can
 			// be at either connector: take whichever sits at the expected far end.
-			const float d1e = FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd );
-			const float d0e = FVector::Dist( c0->GetConnectorLocation(), plan.WaitEnd );
+			const float d1e = FVector::Dist( KindConnectorLocation( kind, c1 ), plan.WaitEnd );
+			const float d0e = FVector::Dist( KindConnectorLocation( kind, c0 ), plan.WaitEnd );
 			bool idMatch = false;
 			if( plan.bHasPendingId )
 			{
 				const FNetConstructionID cid = candidate->GetNetConstructionID();
 				idMatch = cid.NetPlayerID == plan.PendingId.NetPlayerID && cid.Client_ID == plan.PendingId.Client_ID;
 			}
-			UFGFactoryConnectionComponent* joint = nullptr;
+			UFGConnectionComponent* joint = nullptr;
 			float jointDist = 0.f;
 			if( d1e <= 4.f * kJointTolerance )       { joint = c1; jointDist = d1e; }
 			else if( d0e <= 4.f * kJointTolerance )  { joint = c0; jointDist = d0e; }
 			if( !joint )
 			{
-				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new belt %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
-					*candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
-				continue;
+				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new %s %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
+					kind->Name, *candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
+				return true;
 			}
-			plan.LastBelt = candidate;
+			plan.Last = candidate;
 			plan.JointConnection = joint;
 			plan.bWaiting = false;
 			UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms: %s (id match %d, joint is %s, %.0f cm from expected)" ),
 				plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, *candidate->GetName(), idMatch ? 1 : 0,
-				joint == c1 ? TEXT( "connection1/output (drawn with the flow)" ) : TEXT( "connection0/input (drawn against the flow)" ), jointDist );
-			break;
-		}
+				joint == c1 ? TEXT( "connection1 (drawn with the flow)" ) : TEXT( "connection0 (drawn against the flow)" ), jointDist );
+			return false;
+		} );
 		if( plan.bWaiting )
 		{
 			const double waited = FPlatformTime::Seconds() - plan.SentAt;
@@ -501,24 +731,24 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 			if( waited > kPieceTimeout )
 			{
 				// Say what was there, so a miss explains itself.
-				UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] expected piece start %s end %s, sent as %s; belts within 30 m of the start:" ),
-					*plan.WaitStart.ToString(), *plan.WaitEnd.ToString(), plan.bHasPendingId ? *plan.PendingId.ToString() : TEXT( "(no id seen)" ) );
+				UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] expected piece start %s end %s, sent as %s; %ss within 30 m of the start:" ),
+					*plan.WaitStart.ToString(), *plan.WaitEnd.ToString(), plan.bHasPendingId ? *plan.PendingId.ToString() : TEXT( "(no id seen)" ), kind->Name );
 				int32 listed = 0;
-				for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it && listed < 8; ++it )
+				KindForEachBuildable( kind, world, [ & ]( AFGBuildable* buildable )
 				{
-					UFGFactoryConnectionComponent* c0 = it->GetConnection0();
-					UFGFactoryConnectionComponent* c1 = it->GetConnection1();
-					const FVector a = c0 ? c0->GetConnectorLocation() : it->GetActorLocation();
-					const FVector b = c1 ? c1->GetConnectorLocation() : it->GetActorLocation();
+					UFGConnectionComponent* c0 = KindConnection( kind, buildable, 0 );
+					UFGConnectionComponent* c1 = KindConnection( kind, buildable, 1 );
+					const FVector a = c0 ? KindConnectorLocation( kind, c0 ) : buildable->GetActorLocation();
+					const FVector b = c1 ? KindConnectorLocation( kind, c1 ) : buildable->GetActorLocation();
 					if( FVector::Dist( a, plan.WaitStart ) > 3000.f && FVector::Dist( b, plan.WaitStart ) > 3000.f )
 					{
-						continue;
+						return true;
 					}
 					UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain]   %s id=%s c0 %s (%.0f cm from start) c1 %s (%.0f cm from end)" ),
-						*it->GetName(), *it->GetNetConstructionID().ToString(), *a.ToString(), FVector::Dist( a, plan.WaitStart ), *b.ToString(), FVector::Dist( b, plan.WaitEnd ) );
-					++listed;
-				}
-				AbortChain( TEXT( "timed out waiting for the server to build a piece (rejected, or out of belts?)" ) );
+						*buildable->GetName(), *buildable->GetNetConstructionID().ToString(), *a.ToString(), FVector::Dist( a, plan.WaitStart ), *b.ToString(), FVector::Dist( b, plan.WaitEnd ) );
+					return ++listed < 8;
+				} );
+				AbortChain( TEXT( "timed out waiting for the server to build a piece (rejected, or out of parts?)" ) );
 				return false;
 			}
 			return true;
@@ -540,11 +770,12 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 void FSegmentedSplinesHooks::SendNextPiece()
 {
 	FChainPlan& plan = *sChain;
+	const FSplineKind* kind = plan.Kind;
 	UFGBuildGunStateBuild* buildState = plan.BuildState.Get();
-	AFGConveyorBeltHologram* holo = Cast< AFGConveyorBeltHologram >( buildState ? buildState->GetHologram() : nullptr );
-	if( !holo )
+	AFGSplineHologram* holo = Cast< AFGSplineHologram >( buildState ? buildState->GetHologram() : nullptr );
+	if( !holo || FindKind( holo ) != kind )
 	{
-		AbortChain( TEXT( "the build gun no longer holds a belt hologram" ) );
+		AbortChain( *FString::Printf( TEXT( "the build gun no longer holds a %s hologram" ), kind->Name ) );
 		return;
 	}
 	if( holo->GetRecipe() != plan.Recipe )
@@ -552,8 +783,8 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		AbortChain( TEXT( "the build gun switched recipe" ) );
 		return;
 	}
-	AFGBuildableConveyorBelt* previous = plan.LastBelt.Get();
-	UFGFactoryConnectionComponent* jointConnection = plan.JointConnection.Get();
+	AFGBuildable* previous = plan.Last.Get();
+	UFGConnectionComponent* jointConnection = plan.JointConnection.Get();
 	if( !previous || !jointConnection )
 	{
 		AbortChain( TEXT( "the previous piece vanished" ) );
@@ -562,36 +793,33 @@ void FSegmentedSplinesHooks::SendNextPiece()
 
 	const int32 i = plan.NextPiece;
 	const bool bFinal = ( i == plan.Pieces.Num() - 1 );
-	const float maxLength = holo->mMaxSplineLength;
+	const float maxLength = KindMaxLength( kind, holo );
 
-	// The built belt's output is where this piece really starts. Move the piece's first point onto
-	// it (the server may have adjusted the end by a few cm); anything larger means it is not our belt.
+	// The built piece's connector is where this piece really starts. Move the piece's first point
+	// onto it (the server may have adjusted the end by a few cm, and seating a joint pole can have
+	// nudged it); anything larger means it is not our piece.
 	{
-		const FVector connector = jointConnection->GetConnectorLocation();
+		const FVector connector = KindConnectorLocation( kind, jointConnection );
 		const FVector delta = connector - plan.Pieces[ i ][ 0 ].Location;
 		if( delta.Size() > 4.f * kJointTolerance )
 		{
-			AbortChain( *FString::Printf( TEXT( "previous belt's output is %.0f cm from where piece %d starts" ), delta.Size(), i + 1 ) );
+			AbortChain( *FString::Printf( TEXT( "previous piece's connector is %.0f cm from where piece %d starts" ), delta.Size(), i + 1 ) );
 			return;
 		}
 		plan.Pieces[ i ][ 0 ].Location = connector;
-		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] piece %d start moved %.1f cm onto the previous belt's output" ), i + 1, delta.Size() );
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] piece %d start moved %.1f cm onto the previous piece's connector" ), i + 1, delta.Size() );
 	}
 
 	// From here the placement hooks stand aside: the hologram is ours until it is sent.
 	sDriverBusy = true;
 	plan.bHologramIsOurs = true;
 
-	// Start: snapped to the previous belt's output, so the two connect. Vanilla hides the start
+	// Start: snapped to the previous piece's connector, so the two connect. Vanilla hides the start
 	// supports for a snapped start; this hologram never went through that step, so do it by hand.
 	holo->SetActorTransform( plan.Frame );
-	holo->mSnappedConnectionComponents[ 0 ] = jointConnection;
-	holo->mSnappedWallPassthrough[ 0 ] = nullptr;
-	// Flow direction follows from what the start is snapped to (an output feeds this piece, an
-	// input is fed by it); this is vanilla's own routine for that.
-	holo->SetupSnappedConnectionDirections();
+	KindSnapStart( kind, holo, jointConnection );
 	{
-		FEndSupports startSupports = GetBeltSupports( holo, 0 );
+		FEndSupports startSupports = KindSupports( kind, holo, 0 );
 		if( startSupports.Pole && !startSupports.Pole->IsDisabled() ) DisableSupport( startSupports.Pole );
 		for( AFGHologram* mount : startSupports.Mounts )
 		{
@@ -603,9 +831,9 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	if( bFinal && plan.bHasEndHit )
 	{
 		// The last piece ends where the player's cursor was. Let vanilla place that end from the
-		// same hit so it chooses the support (pole, wall or ceiling mount) or snaps to the machine
+		// same hit so it chooses the support (pole, wall or ceiling mount) or snaps to the target
 		// exactly as it did for the original hologram; then put our piece's curve back under it.
-		ApplyPiece( holo, plan.Pieces[ i ] );
+		ApplyPiece( holo, kind, plan.Pieces[ i ] );
 		const bool snapped = holo->TrySnapToActor( plan.EndHit );
 		if( !snapped )
 		{
@@ -616,36 +844,33 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	}
 	else
 	{
-		holo->mSnappedConnectionComponents[ 1 ] = nullptr;
-		holo->mSnappedWallPassthrough[ 1 ] = nullptr;
+		KindClearEndSnap( kind, holo );
 	}
 
 	// Vanilla may have moved the hologram while placing the end; the piece is in world space, so
 	// it lands in the same place regardless.
-	ApplyPiece( holo, plan.Pieces[ i ] );
+	ApplyPiece( holo, kind, plan.Pieces[ i ] );
 
 	if( !bFinal || !plan.bHasEndHit )
 	{
-		const FVector endWorld = plan.Pieces[ i ].Last().Location;
-		SeatOrDisableEndPole( holo, maxLength - kSafetyMargin, GetBeltSupports( holo, 1 ), endWorld, 0.f, false, TEXT( "chain joint" ) );
+		SeatOrDisableEndPole( holo, kind, maxLength - kSafetyMargin, KindSupports( kind, holo, 1 ), TEXT( "chain joint" ) );
 	}
 
 	ValidateForConstruction( holo );
 	if( !holo->CanConstruct() )
 	{
-		TArray< TSubclassOf< UFGConstructDisqualifier > > why;
-		holo->GetConstructDisqualifiers( why );
-		FString names;
-		for( auto& d : why ) names += ( d ? d->GetName() : TEXT( "null" ) ) + TEXT( " " );
+		const FString why = DisqualifierNames( holo );
 		sDriverBusy = false;
-		AbortChain( *FString::Printf( TEXT( "piece %d of %d is not constructible: %s" ), i + 1, plan.Pieces.Num(), *names ) );
+		AbortChain( *FString::Printf( TEXT( "piece %d of %d is not constructible: %s" ), i + 1, plan.Pieces.Num(), *why ) );
 		return;
 	}
 
 	// Hand the finished hologram to the build gun as if the player had clicked on the last step:
 	// vanilla assigns the construction ID, serialises (our hook stands aside), sends, shows the
-	// pending copy and spawns a fresh hologram for whatever comes next.
-	holo->mBuildStep = ESplineHologramBuildStep::SHBS_AdjustPole;
+	// pending copy and spawns a fresh hologram for whatever comes next. Belts and pipes always
+	// finish from the pole-adjust step (proven for free and snapped belt ends); a track has no
+	// such step, so it is put on whatever step the player's own click was accepted from.
+	holo->mBuildStep = kind->bHasPoleAdjustStep ? ESplineHologramBuildStep::SHBS_AdjustPole : plan.FinalStep;
 
 	if( bFinal )
 	{
@@ -662,7 +887,7 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		plan.SentAt = FPlatformTime::Seconds();
 		plan.bSlowNoticed = false;
 	}
-	SnapshotBelts( plan, buildState->GetWorld() );
+	SnapshotBuildables( plan, buildState->GetWorld() );
 
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
 	// The player's click reaches this function; PrimaryFire() itself does nothing when called from
@@ -674,7 +899,7 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	buildState->InternalExecuteDuBuildStepInput( true );
 	if( sChain && buildState->GetHologram() == holo )
 	{
-		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] first step input left the hologram in place (expected), sending the second" ) );
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] first step input left the hologram in place, sending the second" ) );
 		buildState->InternalExecuteDuBuildStepInput( false );
 	}
 	sDriverBusy = false;
@@ -687,22 +912,6 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	{
 		plan.bHologramIsOurs = false;
 		AbortChain( TEXT( "the build gun did not construct the piece (hologram unchanged); it is left in place, a click builds it" ) );
-	}
-}
-
-void FSegmentedSplinesHooks::OnBuildableFailedConstruction( UFGBuildGunStateBuild* self, FNetConstructionID id )
-{
-	if( !sChain || !sChain->bWaiting )
-	{
-		return;
-	}
-	const bool bOurs = !sChain->bHasPendingId
-		|| ( id.NetPlayerID == sChain->PendingId.NetPlayerID && id.Client_ID == sChain->PendingId.Client_ID );
-	UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] server refused construction %s while waiting for piece %d of %d%s" ),
-		*id.ToString(), sChain->NextPiece, sChain->Pieces.Num(), bOurs ? TEXT( "" ) : TEXT( " (a different build; ignored)" ) );
-	if( bOurs )
-	{
-		AbortChain( TEXT( "the server rejected the piece" ) );
 	}
 }
 
@@ -729,116 +938,11 @@ void FSegmentedSplinesHooks::AbortChain( const TCHAR* reason )
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tracks and pipes: cut at the limit
-// ---------------------------------------------------------------------------------------------
-
-void FSegmentedSplinesHooks::OnTrackCheckValidPlacement( AFGRailroadTrackHologram* self )
-{
-	if( !self ) return;
-	// Rails have no end pole. mMaxLength is set per-recipe in the hologram's Blueprint defaults.
-	TruncateIfTooLong( self, self->mMaxLength, FEndSupports(), TEXT( "track" ) );
-}
-
-void FSegmentedSplinesHooks::OnPipelineCheckValidPlacement( AFGPipelineHologram* self )
-{
-	if( !self ) return;
-	FEndSupports supports;
-	supports.Pole = self->mChildPoleHologram[ 1 ].Get();
-	supports.Mounts.Add( self->mChildWallPoleHologram[ 1 ].Get() );
-	TruncateIfTooLong( self, self->mMaxSplineLength, supports, TEXT( "pipeline" ) );
-}
-
-bool FSegmentedSplinesHooks::TruncateIfTooLong( AFGSplineHologram* hologram, float maxLength, const FEndSupports& supports, const TCHAR* debugName )
-{
-	if( !hologram || maxLength <= 0.f )
-	{
-		return false;
-	}
-
-	// Only the player's own hologram. On a listen host the host's hologram is local too, which is fine.
-	if( !hologram->IsLocalHologram() )
-	{
-		return false;
-	}
-
-	// Only act while the player is dragging out the far end. Before that there is no spline to
-	// speak of, and after that (adjusting the end pole) the length is already settled. A support
-	// we disabled must stay disabled through the pole-adjust step and construction, so nothing is
-	// restored here.
-	if( hologram->GetCurrentBuildStep() != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding )
-	{
-		return false;
-	}
-
-	// If the far end is snapped to a connection (a machine input, another pipe...), the player is
-	// clearly aiming at that connection. Cutting short would leave it floating next to the target,
-	// so keep vanilla's "too long" behaviour in that case. Vanilla disables the pole itself while
-	// snapped, so we must not touch it either.
-	if( hologram->IsConnectionSnapped( true ) )
-	{
-		return false;
-	}
-
-	USplineComponent* spline = hologram->mSplineComponent;
-	if( !spline || hologram->mSplineData.Num() < 2 )
-	{
-		return false;
-	}
-
-	const float currentLength = spline->GetSplineLength();
-	if( currentLength <= maxLength )
-	{
-		// Back within the limit: the player gets vanilla's own support choice again.
-		RestoreSupports( supports );
-		return false;
-	}
-
-	const float cutDistance = FMath::Max( maxLength - kSafetyMargin, 0.f );
-
-	// Remember where the end used to be, and which way it pointed, before we move it. The pole's
-	// relation to the old end (top offset, facing) is vanilla's own and is carried over to the new end.
-	const FTransform hologramTransform = hologram->GetActorTransform();
-	const FVector oldEndWorld = hologramTransform.TransformPosition( hologram->mSplineData.Last().Location );
-	const FVector oldEndDir = hologramTransform.TransformVector( hologram->mSplineData.Last().ArriveTangent ).GetSafeNormal2D();
-	const float oldEndYaw = oldEndDir.IsNearlyZero() ? 0.f : oldEndDir.Rotation().Yaw;
-
-	// The game ships a tangent-preserving splitter (used for belt welding / blueprint splitting).
-	// It gives back the two halves as local-space point data; we keep the first and drop the rest.
-	// This is what preserves the curve the player aimed at the far destination: we are not
-	// re-routing a shorter spline, we are cutting the long one.
-	TArray< FSplinePointData > firstHalf;
-	TArray< FSplinePointData > secondHalf;
-	FSplineUtils::SplitSplineAtDistance( spline, cutDistance, firstHalf, secondHalf );
-
-	if( firstHalf.Num() < 2 )
-	{
-		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[%s] SplitSplineAtDistance returned %d points, leaving hologram alone" ), debugName, firstHalf.Num() );
-		return false;
-	}
-
-	hologram->mSplineData = MoveTemp( firstHalf );
-	// Rebuild the visual spline + spline meshes + clearance from the trimmed data, exactly as the
-	// hologram does after routing. Vanilla's CheckValidPlacement (which runs right after this hook)
-	// measures mSplineComponent, so it must be rebuilt before we return.
-	hologram->UpdateSplineComponent();
-
-	float finalLength = hologram->mSplineComponent->GetSplineLength();
-	if( supports.Pole )
-	{
-		finalLength = SeatOrDisableEndPole( hologram, cutDistance, supports, oldEndWorld, oldEndYaw, true, debugName );
-	}
-
-	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] trimmed spline from %.0f cm to %.0f cm (limit %.0f)" ),
-		debugName, currentLength, finalLength, maxLength );
-	return true;
-}
-
-// ---------------------------------------------------------------------------------------------
 // End supports
 // ---------------------------------------------------------------------------------------------
 
-float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram, float cutDistance, const FEndSupports& supports,
-	const FVector& oldEndWorld, float oldEndYaw, bool bPoleIsVanillaPlaced, const TCHAR* debugName )
+float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram, const FSplineKind* kind, float cutDistance,
+	const FEndSupports& supports, const TCHAR* debugName )
 {
 	AFGPoleHologram* pole = supports.Pole;
 	USplineComponent* spline = hologram->mSplineComponent;
@@ -858,16 +962,6 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	}
 
 	FVector newEndWorld = hologramTransform.TransformPosition( hologram->mSplineData.Last().Location );
-
-	// Vertical gap between the spline end and the pole top as vanilla placed them. Normally ~0, but
-	// read it from the live hologram rather than assuming. Only meaningful while the pole is active
-	// and was placed by vanilla for this end; otherwise its state is stale and 0 is the safe guess.
-	float topOffset = 0.f;
-	if( bPoleIsVanillaPlaced && !pole->IsDisabled() )
-	{
-		topOffset = FMath::Clamp( oldEndWorld.Z - ( pole->GetActorLocation().Z + pole->GetPoleHeight() ), -50.f, 50.f );
-	}
-
 	const float maxPoleHeight = GetMaxPoleHeight( pole );
 
 	// Straight down from the end, as far as the tallest pole could reach. Same channel as the
@@ -885,7 +979,7 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	}
 
 	const FVector traceStart = newEndWorld + FVector( 0.f, 0.f, kTraceStartLift );
-	const FVector traceEnd = newEndWorld - FVector( 0.f, 0.f, maxPoleHeight + kMaxPoleSeatNudge + FMath::Abs( topOffset ) );
+	const FVector traceEnd = newEndWorld - FVector( 0.f, 0.f, maxPoleHeight + kMaxPoleSeatNudge );
 
 	FHitResult hit;
 	UWorld* world = hologram->GetWorld();
@@ -905,10 +999,10 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	}
 
 	// Ask for the exact height; the pole picks its closest fixed variation and reports what it got.
-	const float desiredHeight = ( newEndWorld.Z - topOffset ) - hit.ImpactPoint.Z;
+	const float desiredHeight = newEndWorld.Z - hit.ImpactPoint.Z;
 	pole->SetPoleHeight( desiredHeight );
 	const float actualHeight = pole->GetPoleHeight();
-	const float mismatch = ( hit.ImpactPoint.Z + actualHeight + topOffset ) - newEndWorld.Z;
+	const float mismatch = ( hit.ImpactPoint.Z + actualHeight ) - newEndWorld.Z;
 
 	if( FMath::Abs( mismatch ) > kMaxPoleSeatNudge )
 	{
@@ -921,8 +1015,7 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 		return spline->GetSplineLength();
 	}
 
-	// Seat the pole: on the floor, under the end, facing along the end of the curve. For a pole
-	// vanilla placed, keep its convention by turning it by however much the end direction changed.
+	// Seat the pole: on the floor, under the end, facing along the end of the curve.
 	if( sDisabledByUs.Contains( pole ) )
 	{
 		pole->SetDisabled( false );
@@ -932,17 +1025,17 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	FRotator poleRotation = pole->GetActorRotation();
 	if( !newEndDir.IsNearlyZero() )
 	{
-		const float newEndYaw = newEndDir.Rotation().Yaw;
-		poleRotation.Yaw = bPoleIsVanillaPlaced ? poleRotation.Yaw + ( newEndYaw - oldEndYaw ) : newEndYaw;
+		poleRotation.Yaw = newEndDir.Rotation().Yaw;
 	}
 	pole->SetActorLocationAndRotation( hit.ImpactPoint, poleRotation );
 
-	// Put the spline end on the pole top. Vanilla routes the belt to the pole's connection, which
+	// Put the spline end on the pole top. Vanilla routes the spline to the pole's connection, which
 	// is what makes the two meet; an end we placed has to be moved there by hand.
 	if( !FMath::IsNearlyZero( mismatch, 0.5f ) )
 	{
-		hologram->mSplineData.Last().Location += hologramTransform.InverseTransformVector( FVector( 0.f, 0.f, mismatch ) );
-		hologram->UpdateSplineComponent();
+		TArray< FSplinePointData > nudged = hologram->mSplineData;
+		nudged.Last().Location += hologramTransform.InverseTransformVector( FVector( 0.f, 0.f, mismatch ) );
+		SetSplineData( hologram, kind, MoveTemp( nudged ) );
 
 		// The nudge lengthened the curve slightly. If that pushed it back over the limit, cut
 		// once more; the end moves a few cm back along the curve, so keep the pole under it.
@@ -953,8 +1046,7 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 			FSplineUtils::SplitSplineAtDistance( spline, cutDistance, firstHalf, secondHalf );
 			if( firstHalf.Num() >= 2 )
 			{
-				hologram->mSplineData = MoveTemp( firstHalf );
-				hologram->UpdateSplineComponent();
+				SetSplineData( hologram, kind, MoveTemp( firstHalf ) );
 				newEndWorld = hologramTransform.TransformPosition( hologram->mSplineData.Last().Location );
 				pole->SetActorLocation( FVector( newEndWorld.X, newEndWorld.Y, hit.ImpactPoint.Z ) );
 			}

@@ -43,6 +43,14 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   (16:49:48 and 16:59:27 UTC) is the next thing to read; two client-side experiments separate
   the variables: a short vanilla belt on the ground from a fresh pole, and a long ground chain
   started from an existing belt end (no step 1).
+- **Chain generalised to pipes/hypertubes and tracks (2026-10-27, not yet run in-game).** The
+  user found hypertubes and rails "not working the same way" (they only had phase-1 trimming) and
+  a hypertube from a wall hole to a far Y-junction stayed red "too long" (phase 1 stood down on a
+  snapped far end). The chain code is now written against a per-type adapter (`FSplineKind`:
+  belt, pipe, track) and hooked on all three hologram classes; phase-1 trimming is gone. The
+  hypertube does use `AFGPipelineHologram` (its limit is 100 m; earlier logs show `[pipeline]`
+  trims at that limit). First in-game run of pipe and track chains is the next test; the track
+  path has the most guesses (see Phase 2 section).
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -65,8 +73,10 @@ Phases, in order:
 1. **Build what fits** (this draft). Drag past the limit; instead of red "too long", the hologram
    is cut at the limit *along the curve routed toward the cursor*, so the curve you aimed for is
    kept. Build, then continue from the end.
-2. **Chain** (first version in, belts only, 2026-10-26): drag the full distance, build once, mod
-   splits into N equal legal pieces and sends them one after another.
+2. **Chain** (belts proven 2026-10-27; pipes/hypertubes and tracks written, untested): drag the
+   full distance, build once, mod splits into N equal legal pieces and sends them one after
+   another. Phase 1 is retired: the chain covers its case (one piece under the limit is just
+   vanilla), and a snapped far end is handled by the final piece instead of being refused.
 3. **Bonus**: optionally auto-place a chosen blueprint at each joint (mainly for rail junctions).
 
 ## The one rule that makes client-only work
@@ -89,57 +99,51 @@ SML facts (verified in docs):
   This mod's `.uplugin` sets it **false**. Do not remove that.
 - Host→client and client→host mod checks are governed by `RequiredOnRemote` / `RemoteVersionRange`.
 
-## How the current hook works
+## How the hooks work
 
-- Pre-hooks on `CheckValidPlacement` of `AFGConveyorBeltHologram`, `AFGRailroadTrackHologram`,
-  `AFGPipelineHologram` via `SUBSCRIBE_UOBJECT_METHOD` (patches the native class vtable through
-  its CDO; Blueprint subclasses share that vtable, so all tiers are covered).
+- One set of hooks per hologram class (`AFGConveyorBeltHologram`, `AFGPipelineHologram`,
+  `AFGRailroadTrackHologram`), installed by a local macro in `RegisterHooks` with
+  `SUBSCRIBE_UOBJECT_METHOD` (patches the native class vtable through its CDO; Blueprint
+  subclasses share that vtable, so all tiers are covered): `CheckValidPlacement` before and
+  after, `TrySnapToActor`, `SetHologramLocationAndRotation`, `DoMultiStepPlacement` after.
+  All handlers take `AFGSplineHologram*` and look up the type with `FindKind`.
 - The build gun calls `ValidatePlacementAndCost` → `CheckValidPlacement` every update, after
   the spline has been routed, so by then `mSplineData` / `mSplineComponent` are current.
-- If `mSplineComponent->GetSplineLength() > limit`: call the game's own
-  `FSplineUtils::SplitSplineAtDistance(spline, limit - 2cm, first, second)` (declared in
-  `Hologram/HologramHelpers.h`, used by the game for belt welding / blueprint splitting; it
-  preserves tangents), set `mSplineData = first`, call `UpdateSplineComponent()`. Vanilla
-  validation then passes.
-- End support after a trim (belts, pipes): wall/ceiling mount children for the far end are
-  disabled. A line trace on the build gun channel (`ECC_GameTraceChannel5`; `TC_BuildGun` is
-  declared but not defined by the header stubs, so it does not link) goes straight down from the cut end as far as the
-  tallest variation of the pole's buildable class (`AFGBuildablePole::GetPoleVariations`). Floor
-  found (normal.Z >= cos 40 deg): `AFGPoleHologram::SetPoleHeight` picks the closest fixed height,
-  the pole is moved onto the floor under the end and turned by the change in end direction, and
-  the last spline point is nudged vertically onto the pole top (re-trimmed once if that pushed
-  the length over). No floor, or the closest pole height misses by more than 60 cm: the pole is
-  `SetDisabled(true)`, the same switch vanilla uses when a belt end snaps to a machine
-  (`mIsDisabled` is CustomSerialization, so the server sees it too), and the end is left free.
-  Supports we disabled are tracked in a static set and restored only when the drag comes back
-  within the limit; vanilla's own disabling (snapping) is never touched.
-- Skipped when: not local hologram; build step != `SHBS_PlacePoleOrSnapEnding`; far end snapped
-  to a connection (`IsConnectionSnapped(true)`), so aiming at a machine input keeps vanilla's
-  "too long" rather than leaving a belt floating short of it.
+- Per-type knowledge is an `ESplineKind` switch inside `FSegmentedSplinesHooks` (`Kind*`
+  functions), not a class hierarchy, so the Friend access covers all of it: length limit
+  (`mMaxSplineLength` for belts/pipes, `mMaxLength` for tracks), the TooLong disqualifier
+  (`UFGCDConveyorTooLong` / `UFGCDPipeTooLong` / `UFGCDTrackTooLong`), end supports (belt:
+  pole + wall + ceiling mount per end; pipe: pole + wall mount; track: none), how a snapped
+  start is recorded, how the far-end snap is cleared, the built actor class and its two
+  connectors (`AFGBuildableConveyorBelt::GetConnection0/1`, `AFGBuildablePipeBase::
+  GetConnection0/1`, `AFGBuildableRailroadTrack::GetConnection(0/1)`).
+- End support at a joint: wall/ceiling mounts are disabled. A line trace on the build gun
+  channel (`ECC_GameTraceChannel5`; `TC_BuildGun` is declared but not defined by the header
+  stubs, so it does not link) goes straight down from the end as far as the tallest variation
+  of the pole's buildable class (`AFGBuildablePole::GetPoleVariations`). Floor found (normal.Z
+  >= cos 40 deg): `AFGPoleHologram::SetPoleHeight` picks the closest fixed height, the pole is
+  moved onto the floor under the end facing along the curve, and the last spline point is
+  nudged vertically onto the pole top (re-trimmed once if that pushed the length over). No
+  floor, or the closest pole height misses by more than 60 cm: the pole is `SetDisabled(true)`,
+  the same switch vanilla uses when a belt end snaps to a machine (`mIsDisabled` is
+  CustomSerialization, so the server sees it too), and the end is left free. Supports we
+  disabled are tracked in a static set and restored only when the drag comes back within the
+  limit; vanilla's own disabling (snapping) is never touched.
 - Access to protected/private members comes from `Config/AccessTransformers.ini` Friend entries
   for the hook class `FSegmentedSplinesHooks`. These only apply after a C++ build. If the
   header generator ignores a change, add/remove a `;` comment line to bump the mtime.
 - Hooks are registered in `StartupModule` behind `#if !WITH_EDITOR` (docs: hooks can crash the editor).
 
-Alternative if the cut flickers or runs too early: move the shared helper to a post-hook on
-`PostHologramPlacement(const FHitResult&, bool)` (public virtual on all three classes). The belt
-header has `mAutomaticallyGenerateSpline` with comment "Whether or not to automatically generate
-spline in PostHologramPlacement", which is why PostHologramPlacement is the other candidate.
-
 ## Unverified assumptions (check these first)
 
-1. Hypertube recipes use `AFGPipelineHologram` (or a subclass). Both buildables derive from
-   `AFGBuildablePipeBase`, but confirm in the editor. If not, add a fourth hook.
+1. Hypertube recipes use `AFGPipelineHologram`: confirmed in-game (the pipeline hook logged
+   trims at the hypertube's 10000 cm limit; fluid pipes are 5600).
 2. `FSplinePointData` is **not** in the game headers; it is defined in the CSS-modified engine's
    `Components/SplineComponent.h` (every game header that uses it includes only that + FactoryGame.h).
    Fields used: `Location`, `ArriveTangent`, `LeaveTangent` (confirmed from FGBlueprintFunctionLibrary.cpp usage).
-3. End support (see "How the current hook works"). In-game on a vanilla server the first version
-   (pole shifted blindly) built fine on flat ground and went red over empty air. The current
-   version seats or disables the pole; untested as of writing: (a) whether vanilla's belt
-   validation accepts a disabled pole with nothing snapped (vanilla only ever pairs "disabled"
-   with "snapped"), (b) that the pole's yaw convention survives the delta-yaw carry-over, (c)
-   pipes. If (a) fails, fall back to a support search (trace sideways for a wall mount, walk the
-   cut back to the previous pillar).
+3. End support (see "How the hooks work"). Proven for belts on a vanilla server: a disabled
+   pole with nothing snapped builds (free end in the air), and a seated pole at a joint builds.
+   Pipes: the same code path, untested. Tracks: no supports; a free track end is legal in vanilla.
 4. `IsLocalHologram()` is protected on `AFGHologram`; `AFGHologram` is in the Friend list for that.
 5. Rail limit `mMaxLength` is set in Blueprint defaults (no C++ default); belts/pipes default 5600.1 cm.
 6. Everything about the vanilla `.cpp` flow is inferred from headers + comments; the SML repo only
@@ -147,9 +151,10 @@ spline in PostHologramPlacement", which is why PostHologramPlacement is the othe
 
 ## Test plan (also in README)
 
-1. Singleplayer: Mk1 belt, curve mode, drag far past 56 m → valid hologram ending ~56 m along the
-   curve, pole under the new end, builds. Repeat for pipe and rail.
-2. Aim a long belt at a machine input → vanilla red "too long" (snap case excluded by design).
+1. Belt dragged 2-4x the limit (done, works): the full hologram shows valid, one click builds
+   every piece. Repeat for a hypertube, a fluid pipe and a track (untested).
+2. Far end snapped to a machine input / junction / wall hole (belts done, pipes untested): the
+   final piece should snap exactly as the full hologram did.
 3. **Real proof**: local Linux dedicated server (Steam app 1690800) with **no SML**, join from the
    modded client, repeat 1. If the server shows the belt, client-only is proven.
 4. `LogSegmentedSplines` category; set Verbose in Engine.ini for per-cut lines (already set in the
@@ -157,13 +162,33 @@ spline in PostHologramPlacement", which is why PostHologramPlacement is the othe
 5. Chain: Mk1 belt dragged 3-4x the limit across a gap; expect N pieces built one after another,
    joints with a pole where there is floor and free otherwise, the far end as vanilla would place it.
 
-## Phase 2 (chaining) as implemented for belts
+## Phase 2 (chaining) as implemented
 
 In-game result that motivated it: on a vanilla server, a trimmed belt whose cut end hung in the
 air built fine with the pole disabled (free end), so sending one legal piece after another works.
 
-- Belts no longer trim. `IsChainCandidate`: local, step PlacePoleOrSnapEnding or AdjustPole,
-  length > `mMaxSplineLength`, ceil(L / (limit - margin)) <= `kMaxChainPieces` (32).
+- Proven for belts (eleven runs); written the same way for pipes/hypertubes and tracks through
+  the `FSplineKind` adapter, not yet run. `IsChainCandidate`: local, step PlacePoleOrSnapEnding
+  or AdjustPole, length > limit, ceil(L / (limit - margin)) <= `kMaxChainPieces` (32).
+- Type differences the driver has to care about (all in the `Kind*` functions):
+  - Start snap of a later piece. Belt: `mSnappedConnectionComponents[0]`, clear
+    `mSnappedWallPassthrough[0]`, `SetupSnappedConnectionDirections()`. Pipe:
+    `mSnappedConnectionComponents[0]`, `mSnappedPassthroughs.Reset()`. Track: vanilla's own
+    `TryFindAndSnapToOverlappingConnection(0, connectorLocation)` (private; Friend) is tried
+    first, and if it did not land on the previous track's connector the fields are set by hand
+    (`mSnappedConnectionComponents[0]`, `mSnappedStartLocation`, `mSnappedStartTangent` =
+    connector normal, `mSnappedRailroadTrack` = null). Which one happened is logged.
+  - Far-end clear. Belt: connection + wall passthrough [1]. Pipe: connection [1] and every
+    `mSnappedPassthroughs` entry further than 6 m from the spline start (the array does not say
+    which end a wall hole belongs to). Track: connection [1], `mUseCustomEndRotation` = false.
+  - Track `mFloorData` is one floor sample per spline point (local space); whenever
+    `mSplineData` is replaced it is resized to match (floor under each point by trace, else the
+    point itself). Guess: vanilla indexes it per point.
+  - Final build step before the step inputs: belts and pipes `SHBS_AdjustPole` (proven for
+    free and snapped belt ends); tracks the step the player's own final click was accepted
+    from (`FChainPlan::FinalStep`, logged by the `[diag] track DoMultiStepPlacement` line).
+  - Belts store their spline in flow direction and the server may reverse the points; pipes and
+    tracks have no flow, but the joint match accepts either connector regardless.
 - After-hook on `CheckValidPlacement` removes `UFGCDConveyorTooLong` from `mConstructDisqualifiers`
   for a chain candidate, so the full hologram shows valid (everything else vanilla found stands).
 - Pre-hooks on `TrySnapToActor` / `SetHologramLocationAndRotation` record the last cursor hit per
@@ -236,9 +261,8 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   `Client_OnBuildableFailedConstruction` RPC for the pending ID (hooked on its `_Implementation`
   through the build state CDO), hologram gone or recipe changed, previous belt gone, piece not
   constructible (disqualifier names are logged).
-- Not yet: chaining for pipes and tracks (they still trim, phase 1), a preview of the joint
-  supports along the full hologram (the user asked for it; the full curve itself is shown by
-  vanilla).
+- Not yet: a preview of the joint supports along the full hologram (the user asked for it; the
+  full curve itself is shown by vanilla).
 
 Everything above about vanilla's internals (what InternalConstructHologram checks, whether
 SetHologramLocationAndRotation on a fresh hologram in PlacePoleOrSnapEnding needs more start state

@@ -20,11 +20,12 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   aiming the far end at a bare pillar made vanilla's wall mount and our seated floor pole both
   show up and the hologram went red (cause not diagnosed; the chain's final piece now hands that
   end back to vanilla, which sidesteps it).
-- **Phase 2 chain in-game (2026-10-27, eight runs):** planning, piece 1 with the player's build,
-  recognising the built belt by construction ID, and configuring piece 2 on the fresh hologram
-  (continuous, valid, correct joint) all work. The only step still unproven is the programmatic
-  build trigger for pieces 2+: the eighth run showed the press input leaves the belt at the
-  pole-adjust step, so the driver now sends the release input (see Phase 2 section). Untested.
+- **Phase 2 chain works on a vanilla server (2026-10-27, ninth run):** three chains built
+  end to end (14179 cm -> 3 pieces, 8000 cm -> 2, 14593 cm -> 3), each piece arriving in
+  ~140 ms, joints seated on a pole where there was floor and left free otherwise, the far end
+  placed by vanilla (free or snapped). Found in that log and fixed since: the 8000 cm belt cut
+  in half had piece 2 flipped back over piece 1 (`MakeContinuous` no longer reverses, see Phase
+  2 section). The fix is packaged but not yet re-tested.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -192,20 +193,27 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
     recreates the end the player aimed at (pole, wall/ceiling mount, or snapped machine), then the
     piece's curve is put back under it;
   then `ValidatePlacementAndCost`, `mBuildStep = SHBS_AdjustPole` and
-  `UFGBuildGunStateBuild::InternalExecuteDuBuildStepInput(true)` (protected; Friend entry), the
-  function the player's click reaches: vanilla runs DoMultiStepPlacement (final at AdjustPole),
-  assigns the construction ID, serialises (the hook stands aside), sends and spawns a fresh
-  hologram. The argument is `isInputFromARelease`: at the pole-adjust step the *release* of the
-  click is what finishes a belt (eighth run: with `false` DoMultiStepPlacement answered "more
-  steps" and stayed on step 3; the player's own click answered "final" at the same step). If
-  the release leaves the hologram in place the driver tries a press (`false`) once.
+  `UFGBuildGunStateBuild::InternalExecuteDuBuildStepInput` (protected; Friend entry), the
+  function the player's click reaches: vanilla runs DoMultiStepPlacement, assigns the
+  construction ID, serialises (the hook stands aside), sends and spawns a fresh hologram. At
+  the pole-adjust step the FIRST step input is swallowed (DoMultiStepPlacement answers "more
+  steps" and stays on step 3, press or release alike: eighth and ninth runs) and the SECOND
+  finishes the belt; a player's click is a press plus a release, which is why their click
+  always built it. The driver sends a release (`true`), then a press (`false`) if the hologram
+  is still there.
   `PrimaryFire()` called from code does nothing (seventh run: the configured hologram stayed,
   and the player's own click then built it, step 3, server accepted). If the build gun still
   holds the same hologram afterwards, nothing went out: the chain stops but leaves the
   hologram, which is valid, for the player to click.
 - Splitter convention (confirmed seventh run): `SplitSplineAtDistance`'s second half has its
   first point at the local origin, i.e. it is relative to the split point; `MakeContinuous`
-  translates it onto the split point. Pieces of a 2-point curve are 2-point curves.
+  translates it onto the split point and never flips it. (It used to flip the half when its
+  END was at the split point; a straight belt cut exactly in half satisfies that by
+  coincidence, and the ninth run's 8000 cm belt got piece 2 built backwards over piece 1.)
+  Pieces of a 2-point curve are 2-point curves.
+- Seating the joint pole can nudge the joint vertically (up to 60 cm); the next piece's start is
+  then moved onto the built belt's real output connector (ninth run: 44.7 cm), its remaining
+  points unchanged. Joint tolerance for recognising the built belt is 100 cm, so this fits.
 - Abort (log Warning, leave the partial run) on: timeout, hologram gone or recipe changed, previous
   belt gone, piece not constructible (disqualifier names are logged).
 - Not yet: chaining for pipes and tracks (they still trim, phase 1), a preview of the joint

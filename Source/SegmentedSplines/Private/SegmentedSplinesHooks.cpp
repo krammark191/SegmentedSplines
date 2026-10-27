@@ -25,7 +25,6 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
-#include "Algo/Reverse.h"
 
 TSet< TWeakObjectPtr< AFGHologram > > FSegmentedSplinesHooks::sDisabledByUs;
 TMap< TWeakObjectPtr< AFGHologram >, FHitResult > FSegmentedSplinesHooks::sLastHit;
@@ -378,33 +377,21 @@ void FSegmentedSplinesHooks::ToWorld( const FTransform& frame, TArray< FSplinePo
 
 bool FSegmentedSplinesHooks::MakeContinuous( TArray< FSplinePointData >& piece, const FVector& expectedStart, const TCHAR* what )
 {
+	// The splitter's second half is relative to the split point: its first point is at the local
+	// origin (confirmed in-game). Move it so that it starts at the split point. It must never be
+	// flipped on the strength of its end position: a straight belt cut in half has its relative
+	// second half END exactly where the split point is in hologram space, and the ninth run's
+	// 8000 cm belt got its piece 2 reversed back over piece 1 that way.
 	const float startGap = FVector::Dist( piece[ 0 ].Location, expectedStart );
-	if( startGap <= kJointTolerance )
+	if( startGap > kJointTolerance )
 	{
-		return true;
-	}
-	const float endGap = FVector::Dist( piece.Last().Location, expectedStart );
-	if( endGap <= kJointTolerance )
-	{
-		// Points run the other way: reverse the order and the tangents.
-		Algo::Reverse( piece );
+		const FVector shift = expectedStart - piece[ 0 ].Location;
 		for( FSplinePointData& point : piece )
 		{
-			const FVector arrive = point.ArriveTangent;
-			point.ArriveTangent = -point.LeaveTangent;
-			point.LeaveTangent = -arrive;
+			point.Location += shift;
 		}
-		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half came reversed, flipped it" ), what );
-		return true;
 	}
-	// Neither end is at the split point: the half is offset (relative to the split point, or to
-	// something else). Its shape is still the curve we want, so move it so that it starts there.
-	const FVector shift = expectedStart - piece[ 0 ].Location;
-	for( FSplinePointData& point : piece )
-	{
-		point.Location += shift;
-	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half started %.0f cm from the split point (end %.0f cm away), translated it onto it" ), what, startGap, endGap );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half started %.0f cm from the split point, translated onto it" ), what, startGap );
 	return true;
 }
 
@@ -664,14 +651,14 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
 	// The player's click reaches this function; PrimaryFire() itself does nothing when called from
 	// code (seventh run: the hologram stayed, and the player's own click then built it as is).
-	// At the pole-adjust step it is the *release* of the click that finishes the belt: with a
-	// press, DoMultiStepPlacement answered "more steps" and stayed on step 3 (eighth run), while
-	// the player's own click answered "final" at the same step. Send the release; if the build gun
-	// ignores it, fall back to a press before giving up.
+	// At the pole-adjust step the FIRST step input is swallowed (DoMultiStepPlacement answers
+	// "more steps" and stays on step 3, whether it is a press or a release: eighth and ninth
+	// runs) and the SECOND one finishes the belt. A player's click is a press and a release,
+	// which is why their click always built it. Send a release, then a press if needed.
 	buildState->InternalExecuteDuBuildStepInput( true );
 	if( sChain && buildState->GetHologram() == holo )
 	{
-		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] release input left the hologram in place, trying a press" ) );
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] first step input left the hologram in place (expected), sending the second" ) );
 		buildState->InternalExecuteDuBuildStepInput( false );
 	}
 	sDriverBusy = false;

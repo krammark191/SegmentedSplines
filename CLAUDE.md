@@ -30,6 +30,19 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   (vanilla logged "Hit limit of 96 saved moves", missed acks, server Playing -> Offline ->
   Playing) and the 10 s wait gave up before the belt arrived. The wait is now 60 s with a
   "still waiting" line at 5 s, and the server's rejection RPC ends the chain at once instead.
+  Eleventh run (ground again): the whole chain built, piece 1 after 16.7 s, piece 2 in 40 ms.
+- **Open: server stalls on ground runs (2026-10-27).** Both ground runs stalled; none of the
+  17 air chains did. In both, the client stopped getting move acks within ~1 s of the belt
+  START being placed (press -> step 1 AdjustStartingPole, release -> step 2: a fresh floor
+  pole; every air run started snapped to something and went straight to step 2), i.e. before
+  any construction message. 30-50 s later the server came back and the piece arrived. The mod
+  sends nothing during a drag (per-frame hooks are local: RestoreSupports, TooLong removal,
+  last-hit capture), so the client log cannot say why; one earlier stall (01:56, first session)
+  had no build going at all, and the two onsets are 9 min 39 s apart, so a periodic server
+  job (autosave?) is as likely as the ground start. The server's own log at the onset times
+  (16:49:48 and 16:59:27 UTC) is the next thing to read; two client-side experiments separate
+  the variables: a short vanilla belt on the ground from a fresh pole, and a long ground chain
+  started from an existing belt end (no step 1).
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

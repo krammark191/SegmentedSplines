@@ -160,8 +160,12 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   Dead end: `UFGBuildGunStateBuild::InternalConstructHologram` is never called on the client
   (it is the server half); a hook there sees nothing.
 - `TickChain` (core ticker) waits for the previous piece's belt to replicate: it scans
-  `AFGBuildableConveyorBelt` actors for one whose connection0/1 are within 25 cm of the piece's
-  ends, 10 s timeout. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
+  `AFGBuildableConveyorBelt` actors for the one whose replicated `GetNetConstructionID()` has the
+  NetPlayerID/Client_ID the client sent (captured in the serializer hook: the client serialises
+  twice per build, an empty-ID pass for its pending copy, then the real ID), falling back to
+  connection0/1 within 25 cm of the piece's ends; 10 s timeout, which then lists nearby belts
+  with their IDs and end distances. Third in-game run (2026-10-26): trigger and piece 1 worked,
+  the end-position match never found the built belt, hence the ID match. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
   build (`GetHologram()`), puts it in the plan's frame, snaps its start to the previous belt's
   `GetConnection1()`, disables its start supports by hand, sets the build step, and:
   - intermediate piece: clears the end snap, `SeatOrDisableEndPole` at the joint;

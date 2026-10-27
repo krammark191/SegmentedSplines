@@ -221,6 +221,14 @@ void FSegmentedSplinesHooks::OnSerializeConstructMessage( IFGConstructionMessage
 	{
 		StartChain( belt, TEXT( "SerializeConstructMessage" ) );
 	}
+	// The client serialises twice per build: once with an empty ID to make its pending copy, then
+	// with the real ID for the server. The built belt replicates back carrying that ID.
+	if( ar.IsSaving() && sChain && id.NetPlayerID >= 0 )
+	{
+		sChain->PendingId = id;
+		sChain->bHasPendingId = true;
+		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d sent as %s" ), sChain->NextPiece, *id.ToString() );
+	}
 }
 
 void FSegmentedSplinesHooks::StartChain( AFGConveyorBeltHologram* belt, const TCHAR* trigger )
@@ -358,23 +366,34 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 
 	if( plan.bWaiting )
 	{
-		// The server builds the piece and replicates the belt back. Find it by its ends.
+		// The server builds the piece and replicates the belt back. It carries the construction ID
+		// the client sent (replicated); failing that, match it by its ends.
 		for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
 		{
 			AFGBuildableConveyorBelt* candidate = *it;
-			UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
-			UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
-			if( !c0 || !c1 )
+			bool match = false;
+			const TCHAR* how = TEXT( "" );
+			if( plan.bHasPendingId )
 			{
-				continue;
+				const FNetConstructionID cid = candidate->GetNetConstructionID();
+				match = cid.NetPlayerID == plan.PendingId.NetPlayerID && cid.Client_ID == plan.PendingId.Client_ID;
+				how = TEXT( "construction id" );
 			}
-			if( FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart ) <= kJointTolerance
-				&& FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd ) <= kJointTolerance )
+			if( !match )
+			{
+				UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
+				UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
+				match = c0 && c1
+					&& FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart ) <= kJointTolerance
+					&& FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd ) <= kJointTolerance;
+				how = TEXT( "end positions" );
+			}
+			if( match )
 			{
 				plan.LastBelt = candidate;
 				plan.bWaiting = false;
-				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms" ),
-					plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0 );
+				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms (matched by %s: %s)" ),
+					plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, how, *candidate->GetName() );
 				break;
 			}
 		}
@@ -382,6 +401,24 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 		{
 			if( FPlatformTime::Seconds() - plan.SentAt > kPieceTimeout )
 			{
+				// Say what was there, so a miss explains itself.
+				UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] expected piece start %s end %s, sent as %s; belts within 30 m of the start:" ),
+					*plan.WaitStart.ToString(), *plan.WaitEnd.ToString(), plan.bHasPendingId ? *plan.PendingId.ToString() : TEXT( "(no id seen)" ) );
+				int32 listed = 0;
+				for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it && listed < 8; ++it )
+				{
+					UFGFactoryConnectionComponent* c0 = it->GetConnection0();
+					UFGFactoryConnectionComponent* c1 = it->GetConnection1();
+					const FVector a = c0 ? c0->GetConnectorLocation() : it->GetActorLocation();
+					const FVector b = c1 ? c1->GetConnectorLocation() : it->GetActorLocation();
+					if( FVector::Dist( a, plan.WaitStart ) > 3000.f && FVector::Dist( b, plan.WaitStart ) > 3000.f )
+					{
+						continue;
+					}
+					UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain]   %s id=%s c0 %s (%.0f cm from start) c1 %s (%.0f cm from end)" ),
+						*it->GetName(), *it->GetNetConstructionID().ToString(), *a.ToString(), FVector::Dist( a, plan.WaitStart ), *b.ToString(), FVector::Dist( b, plan.WaitEnd ) );
+					++listed;
+				}
 				AbortChain( TEXT( "timed out waiting for the server to build a piece (rejected, or out of belts?)" ) );
 				return false;
 			}
@@ -500,6 +537,7 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	{
 		plan.NextPiece = i + 1;
 		plan.bWaiting = true;
+		plan.bHasPendingId = false;
 		plan.WaitStart = plan.Frame.TransformPosition( plan.Pieces[ i ][ 0 ].Location );
 		plan.WaitEnd = plan.Frame.TransformPosition( plan.Pieces[ i ].Last().Location );
 		plan.SentAt = FPlatformTime::Seconds();

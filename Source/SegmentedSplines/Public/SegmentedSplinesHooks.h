@@ -103,6 +103,9 @@ private:
 		bool bHasEndHit = false;
 		/** Index of the next piece to send. */
 		int32 NextPiece = 0;
+		/** Construction ID the client sent for the piece being waited on; the built belt carries it (replicated). */
+		FNetConstructionID PendingId;
+		bool bHasPendingId = false;
 		/** Waiting for the belt of piece NextPiece-1 to replicate. */
 		bool bWaiting = false;
 		FVector WaitStart = FVector::ZeroVector;

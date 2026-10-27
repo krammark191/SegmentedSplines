@@ -79,7 +79,12 @@ private:
 	static constexpr float kJointTolerance = 25.0f;
 
 	/** Give up on a piece if the server has not sent its belt back within this time. [s] */
-	static constexpr double kPieceTimeout = 10.0;
+	/** How long to wait for the server to build a piece. A lag spike on a remote server (tenth run:
+	 *  the link dropped for ~45 s, the piece showed up when it came back) must not end the chain;
+	 *  an outright rejection ends it at once through the build gun's failure RPC. */
+	static constexpr double kPieceTimeout = 60.0;
+	/** After this long a "still waiting" line is logged once, so a slow piece explains itself. */
+	static constexpr double kPieceSlowNotice = 5.0;
 
 	/** The supports vanilla may have placed under one end of a spline. */
 	struct FEndSupports
@@ -117,6 +122,7 @@ private:
 		FVector WaitStart = FVector::ZeroVector;
 		FVector WaitEnd = FVector::ZeroVector;
 		double SentAt = 0.0;
+		bool bSlowNoticed = false;
 		TWeakObjectPtr< AFGBuildableConveyorBelt > LastBelt;
 		/** The built belt's connector at the joint, whichever of its two it turned out to be. */
 		TWeakObjectPtr< UFGFactoryConnectionComponent > JointConnection;
@@ -162,6 +168,8 @@ private:
 	static void OnBeltAfterMultiStepPlacement( bool bFinalStep, AFGConveyorBeltHologram* self );
 	/** The client turns a hologram into a construction message (also runs on loading; fallback trigger). */
 	static void OnSerializeConstructMessage( IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id );
+	/** The server refused a construction message: if it is the piece being waited on, stop the chain. */
+	static void OnBuildableFailedConstruction( UFGBuildGunStateBuild* self, FNetConstructionID id );
 	/** Reshape a chainable belt into piece 0 and start the driver, once. */
 	static void StartChain( AFGConveyorBeltHologram* belt, const TCHAR* trigger );
 

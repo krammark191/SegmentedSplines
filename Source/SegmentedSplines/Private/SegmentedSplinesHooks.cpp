@@ -96,6 +96,14 @@ void FSegmentedSplinesHooks::RegisterHooks()
 			OnSerializeConstructMessage( self, ar, id );
 		} );
 
+	// The server's answer to a refused construction message. Vanilla uses it to restore the
+	// hologram; the chain uses it to stop at once instead of waiting out the timeout.
+	SUBSCRIBE_UOBJECT_METHOD( UFGBuildGunStateBuild, Client_OnBuildableFailedConstruction_Implementation,
+		[]( auto& scope, UFGBuildGunStateBuild* self, FNetConstructionID id )
+		{
+			OnBuildableFailedConstruction( self, id );
+		} );
+
 	SUBSCRIBE_UOBJECT_METHOD( AFGRailroadTrackHologram, CheckValidPlacement,
 		[]( auto& scope, AFGRailroadTrackHologram* self )
 		{
@@ -483,7 +491,14 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 		}
 		if( plan.bWaiting )
 		{
-			if( FPlatformTime::Seconds() - plan.SentAt > kPieceTimeout )
+			const double waited = FPlatformTime::Seconds() - plan.SentAt;
+			if( !plan.bSlowNoticed && waited > kPieceSlowNotice )
+			{
+				plan.bSlowNoticed = true;
+				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] still waiting for piece %d of %d after %.0f s (slow server or link; giving it %.0f s)" ),
+					plan.NextPiece, plan.Pieces.Num(), waited, kPieceTimeout );
+			}
+			if( waited > kPieceTimeout )
 			{
 				// Say what was there, so a miss explains itself.
 				UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] expected piece start %s end %s, sent as %s; belts within 30 m of the start:" ),
@@ -645,6 +660,7 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		plan.WaitStart = plan.Pieces[ i ][ 0 ].Location;
 		plan.WaitEnd = plan.Pieces[ i ].Last().Location;
 		plan.SentAt = FPlatformTime::Seconds();
+		plan.bSlowNoticed = false;
 	}
 	SnapshotBelts( plan, buildState->GetWorld() );
 
@@ -671,6 +687,22 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	{
 		plan.bHologramIsOurs = false;
 		AbortChain( TEXT( "the build gun did not construct the piece (hologram unchanged); it is left in place, a click builds it" ) );
+	}
+}
+
+void FSegmentedSplinesHooks::OnBuildableFailedConstruction( UFGBuildGunStateBuild* self, FNetConstructionID id )
+{
+	if( !sChain || !sChain->bWaiting )
+	{
+		return;
+	}
+	const bool bOurs = !sChain->bHasPendingId
+		|| ( id.NetPlayerID == sChain->PendingId.NetPlayerID && id.Client_ID == sChain->PendingId.Client_ID );
+	UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] server refused construction %s while waiting for piece %d of %d%s" ),
+		*id.ToString(), sChain->NextPiece, sChain->Pieces.Num(), bOurs ? TEXT( "" ) : TEXT( " (a different build; ignored)" ) );
+	if( bOurs )
+	{
+		AbortChain( TEXT( "the server rejected the piece" ) );
 	}
 }
 

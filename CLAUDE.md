@@ -149,7 +149,9 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   build gun accepting the click as the final step; it serialises and sends right after, so the
   hologram is reshaped into piece 0 in between (`StartChain` -> `PlanChain`: cut the curve into
   N equal pieces with `SplitSplineAtDistance`, reusing the hologram's spline component for each
-  remainder; piece 0 keeps the player's start, end snap cleared, joint via `SeatOrDisableEndPole`,
+  remainder. The splitter's SECOND half does not start at the split point (sixth run: piece 2's
+  first point was a piece length from the joint); `MakeContinuous` reverses it if it ends there,
+  else translates it onto the split point, and logs which. Every piece's end points are logged; piece 0 keeps the player's start, end snap cleared, joint via `SeatOrDisableEndPole`,
   re-validated). Fallback trigger plus diagnostics: `IFGConstructionMessageInterface::
   SerializeConstructMessage` hooked through the interface type (`SUBSCRIBE_METHOD_VIRTUAL` with
   the belt CDO cast to the interface). Hooking it as `AFGHologram::SerializeConstructMessage`

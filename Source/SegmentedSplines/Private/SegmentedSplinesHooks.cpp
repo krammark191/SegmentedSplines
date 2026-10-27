@@ -25,6 +25,7 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
+#include "Algo/Reverse.h"
 
 TSet< TWeakObjectPtr< AFGHologram > > FSegmentedSplinesHooks::sDisabledByUs;
 TMap< TWeakObjectPtr< AFGHologram >, FHitResult > FSegmentedSplinesHooks::sLastHit;
@@ -299,6 +300,12 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 			UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] split %d of %d produced %d + %d points, building vanilla's way" ), i + 1, numPieces, first.Num(), rest.Num() );
 			return false;
 		}
+		if( !MakeContinuous( rest, first.Last().Location, *FString::Printf( TEXT( "split %d" ), i + 1 ) ) )
+		{
+			belt->mSplineData = remaining;
+			belt->UpdateSplineComponent();
+			return false;
+		}
 		plan->Pieces.Add( MoveTemp( first ) );
 		remaining = MoveTemp( rest );
 	}
@@ -306,6 +313,11 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 	for( TArray< FSplinePointData >& piece : plan->Pieces )
 	{
 		ToWorld( plan->Frame, piece );
+	}
+	for( int32 i = 0; i < plan->Pieces.Num(); ++i )
+	{
+		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d: %d points, %s -> %s" ), i + 1, plan->Pieces[ i ].Num(),
+			*plan->Pieces[ i ][ 0 ].Location.ToString(), *plan->Pieces[ i ].Last().Location.ToString() );
 	}
 
 	// Piece 0 keeps the player's start (its snap and start pole are already vanilla's) and gets a
@@ -361,6 +373,38 @@ void FSegmentedSplinesHooks::ToWorld( const FTransform& frame, TArray< FSplinePo
 		point.ArriveTangent = frame.TransformVector( point.ArriveTangent );
 		point.LeaveTangent = frame.TransformVector( point.LeaveTangent );
 	}
+}
+
+bool FSegmentedSplinesHooks::MakeContinuous( TArray< FSplinePointData >& piece, const FVector& expectedStart, const TCHAR* what )
+{
+	const float startGap = FVector::Dist( piece[ 0 ].Location, expectedStart );
+	if( startGap <= kJointTolerance )
+	{
+		return true;
+	}
+	const float endGap = FVector::Dist( piece.Last().Location, expectedStart );
+	if( endGap <= kJointTolerance )
+	{
+		// Points run the other way: reverse the order and the tangents.
+		Algo::Reverse( piece );
+		for( FSplinePointData& point : piece )
+		{
+			const FVector arrive = point.ArriveTangent;
+			point.ArriveTangent = -point.LeaveTangent;
+			point.LeaveTangent = -arrive;
+		}
+		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half came reversed, flipped it" ), what );
+		return true;
+	}
+	// Neither end is at the split point: the half is offset (relative to the split point, or to
+	// something else). Its shape is still the curve we want, so move it so that it starts there.
+	const FVector shift = expectedStart - piece[ 0 ].Location;
+	for( FSplinePointData& point : piece )
+	{
+		point.Location += shift;
+	}
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s: second half started %.0f cm from the split point (end %.0f cm away), translated it onto it" ), what, startGap, endGap );
+	return true;
 }
 
 void FSegmentedSplinesHooks::ApplyPiece( AFGConveyorBeltHologram* hologram, const TArray< FSplinePointData >& worldPiece )

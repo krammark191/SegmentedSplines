@@ -172,6 +172,12 @@ private:
 	/** Put a world-space piece on a hologram, in the hologram's current transform. */
 	static void ApplyPiece( AFGConveyorBeltHologram* hologram, const TArray< FSplinePointData >& worldPiece );
 	static void ToWorld( const FTransform& frame, TArray< FSplinePointData >& points );
+	/**
+	 * Make a piece start where the previous one ended. The game's splitter returns the second
+	 * half in a form that does not start at the split point (seen in-game: a piece length away);
+	 * reverse it if it ends there, otherwise translate it there. Returns false if neither fits.
+	 */
+	static bool MakeContinuous( TArray< FSplinePointData >& piece, const FVector& expectedStart, const TCHAR* what );
 	static void SnapshotBelts( FChainPlan& plan, UWorld* world );
 	/** Configure the build gun's current hologram as the next piece and have the build gun build it. */
 	static void SendNextPiece();

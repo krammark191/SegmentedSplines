@@ -49,8 +49,10 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   snapped far end). The chain code is now written against a per-type adapter (`FSplineKind`:
   belt, pipe, track) and hooked on all three hologram classes; phase-1 trimming is gone. The
   hypertube does use `AFGPipelineHologram` (its limit is 100 m; earlier logs show `[pipeline]`
-  trims at that limit). First in-game run of pipe and track chains is the next test; the track
-  path has the most guesses (see Phase 2 section).
+  trims at that limit). Twelfth run (hypertube, wall support to wall support) crashed the game
+  inside `AFGPipelineHologram::ValidatePipeline` because the chain had emptied
+  `mSnappedPassthroughs`; fixed by nulling its slots instead (see Phase 2 section). Pipe and
+  track chains are still unproven; the track path has the most guesses.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -179,8 +181,11 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
     (`mSnappedConnectionComponents[0]`, `mSnappedStartLocation`, `mSnappedStartTangent` =
     connector normal, `mSnappedRailroadTrack` = null). Which one happened is logged.
   - Far-end clear. Belt: connection + wall passthrough [1]. Pipe: connection [1] and every
-    `mSnappedPassthroughs` entry further than 6 m from the spline start (the array does not say
-    which end a wall hole belongs to). Track: connection [1], `mUseCustomEndRotation` = false.
+    `mSnappedPassthroughs` entry further than 6 m from the spline start is set to null (the
+    array does not say which end a wall hole belongs to). NEVER shrink that array: vanilla's
+    `ValidatePipeline` indexes it without a size check and the twelfth run crashed the game
+    (`Array index out of bounds: 0 into an array of size 0`) when the chain had `RemoveAll`'d
+    its null slots. Track: connection [1], `mUseCustomEndRotation` = false.
   - Track `mFloorData` is one floor sample per spline point (local space); whenever
     `mSplineData` is replaced it is resized to match (floor under each point by trace, else the
     point itself). Guess: vanilla indexes it per point.

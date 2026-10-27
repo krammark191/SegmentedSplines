@@ -187,7 +187,12 @@ void FSegmentedSplinesHooks::KindSnapStart( const FSplineKind* kind, AFGSplineHo
 		AFGPipelineHologram* pipe = static_cast< AFGPipelineHologram* >( hologram );
 		pipe->mSnappedConnectionComponents[ 0 ] = Cast< UFGPipeConnectionComponentBase >( joint );
 		// Wall holes the player's hologram went through belong to the player's piece, not this one.
-		pipe->mSnappedPassthroughs.Reset();
+		// The list keeps a slot per end that vanilla indexes without checking (ValidatePipeline
+		// crashed on an emptied list in the twelfth run), so the slots are nulled, never removed.
+		for( TObjectPtr< AFGBuildablePassthrough >& passthrough : pipe->mSnappedPassthroughs )
+		{
+			passthrough = nullptr;
+		}
 		break;
 	}
 	case ESplineKind::Track:
@@ -228,12 +233,16 @@ void FSegmentedSplinesHooks::KindClearEndSnap( const FSplineKind* kind, AFGSplin
 		AFGPipelineHologram* pipe = static_cast< AFGPipelineHologram* >( hologram );
 		pipe->mSnappedConnectionComponents[ 1 ] = nullptr;
 		// The passthrough list does not say which end each wall hole belongs to; keep the ones at
-		// the start (the player's own) and drop any other, which can only have been at the far end.
+		// the start (the player's own) and null any other, which can only have been at the far end.
+		// Slots are nulled, never removed: vanilla indexes the list without checking its size.
 		const FVector startWorld = hologram->GetActorTransform().TransformPosition( hologram->mSplineData[ 0 ].Location );
-		pipe->mSnappedPassthroughs.RemoveAll( [ & ]( const TObjectPtr< AFGBuildablePassthrough >& passthrough )
+		for( TObjectPtr< AFGBuildablePassthrough >& passthrough : pipe->mSnappedPassthroughs )
 		{
-			return !passthrough || FVector::Dist( passthrough->GetActorLocation(), startWorld ) > 600.f;
-		} );
+			if( passthrough && FVector::Dist( passthrough->GetActorLocation(), startWorld ) > 600.f )
+			{
+				passthrough = nullptr;
+			}
+		}
 		break;
 	}
 	case ESplineKind::Track:

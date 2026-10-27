@@ -187,9 +187,16 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
     recreates the end the player aimed at (pole, wall/ceiling mount, or snapped machine), then the
     piece's curve is put back under it;
   then `ValidatePlacementAndCost`, `mBuildStep = SHBS_AdjustPole` and
-  `UFGBuildGunStateBuild::PrimaryFire()`: vanilla treats it as the player's final click, assigns
-  the construction ID, serialises (the hook stands aside), sends and spawns a fresh hologram. If
-  the build gun still holds the same hologram afterwards, nothing went out and the chain aborts.
+  `UFGBuildGunStateBuild::InternalExecuteDuBuildStepInput(false)` (protected; Friend entry), the
+  function the player's click reaches: vanilla runs DoMultiStepPlacement (final at AdjustPole),
+  assigns the construction ID, serialises (the hook stands aside), sends and spawns a fresh
+  hologram. `PrimaryFire()` called from code does nothing (seventh run: the configured hologram
+  stayed, and the player's own click then built it, step 3, server accepted). If the build gun
+  still holds the same hologram afterwards, nothing went out: the chain stops but leaves the
+  hologram, which is valid, for the player to click.
+- Splitter convention (confirmed seventh run): `SplitSplineAtDistance`'s second half has its
+  first point at the local origin, i.e. it is relative to the split point; `MakeContinuous`
+  translates it onto the split point. Pieces of a 2-point curve are 2-point curves.
 - Abort (log Warning, leave the partial run) on: timeout, hologram gone or recipe changed, previous
   belt gone, piece not constructible (disqualifier names are logged).
 - Not yet: chaining for pipes and tracks (they still trim, phase 1), a preview of the joint

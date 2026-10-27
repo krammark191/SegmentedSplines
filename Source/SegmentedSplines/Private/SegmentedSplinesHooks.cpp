@@ -194,14 +194,15 @@ void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, 
 
 void FSegmentedSplinesHooks::OnBeltAfterMultiStepPlacement( bool bFinalStep, AFGConveyorBeltHologram* self )
 {
-	if( !self || sDriverBusy || !self->IsLocalHologram() )
+	if( !self || !self->IsLocalHologram() )
 	{
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)" ),
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)%s" ),
 		bFinalStep ? TEXT( "final" ) : TEXT( "more steps" ), static_cast< int32 >( self->GetCurrentBuildStep() ),
-		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, self->mMaxSplineLength );
-	if( bFinalStep )
+		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, self->mMaxSplineLength,
+		sDriverBusy ? TEXT( " [driver]" ) : TEXT( "" ) );
+	if( bFinalStep && !sDriverBusy )
 	{
 		StartChain( self, TEXT( "DoMultiStepPlacement" ) );
 	}
@@ -661,15 +662,19 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	SnapshotBelts( plan, buildState->GetWorld() );
 
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
-	buildState->PrimaryFire();
+	// The player's click reaches this function; PrimaryFire() itself does nothing when called from
+	// code (seventh run: the hologram stayed, and the player's own click then built it as is).
+	buildState->InternalExecuteDuBuildStepInput( false );
 	sDriverBusy = false;
 	plan.bHologramIsOurs = false;
 
 	// A send replaces the build gun's hologram with a fresh one. If it is still ours, the build gun
-	// did not accept the click as a final step and nothing went out.
+	// did not accept the input as a final step and nothing went out. Leave the hologram as it is:
+	// it is valid, and the player can click to build it by hand.
 	if( sChain && buildState->GetHologram() == holo )
 	{
-		AbortChain( TEXT( "the build gun did not construct the piece on PrimaryFire (hologram unchanged)" ) );
+		plan.bHologramIsOurs = false;
+		AbortChain( TEXT( "the build gun did not construct the piece (hologram unchanged); it is left in place, a click builds it" ) );
 	}
 }
 

@@ -664,7 +664,16 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
 	// The player's click reaches this function; PrimaryFire() itself does nothing when called from
 	// code (seventh run: the hologram stayed, and the player's own click then built it as is).
-	buildState->InternalExecuteDuBuildStepInput( false );
+	// At the pole-adjust step it is the *release* of the click that finishes the belt: with a
+	// press, DoMultiStepPlacement answered "more steps" and stayed on step 3 (eighth run), while
+	// the player's own click answered "final" at the same step. Send the release; if the build gun
+	// ignores it, fall back to a press before giving up.
+	buildState->InternalExecuteDuBuildStepInput( true );
+	if( sChain && buildState->GetHologram() == holo )
+	{
+		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] release input left the hologram in place, trying a press" ) );
+		buildState->InternalExecuteDuBuildStepInput( false );
+	}
 	sDriverBusy = false;
 	plan.bHologramIsOurs = false;
 

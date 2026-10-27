@@ -17,6 +17,7 @@ class AFGPipelineHologram;
 class AFGBuildableConveyorBelt;
 class UFGBuildGunStateBuild;
 class UFGRecipe;
+class FArchive;
 
 /**
  * Segmented Splines.
@@ -78,12 +79,6 @@ private:
 	/** Give up on a piece if the server has not sent its belt back within this time. [s] */
 	static constexpr double kPieceTimeout = 10.0;
 
-	/**
-	 * Construction IDs for pieces after the first are the first piece's ID with Client_ID moved
-	 * this far up, so they cannot collide with the IDs the build gun keeps handing out.
-	 */
-	static constexpr uint16 kChainIdOffset = 10000;
-
 	/** The supports vanilla may have placed under one end of a spline. */
 	struct FEndSupports
 	{
@@ -105,7 +100,6 @@ private:
 		/** What the cursor hit when the player placed the far end; recreates vanilla's end support. */
 		FHitResult EndHit;
 		bool bHasEndHit = false;
-		FNetConstructionID BaseId;
 		/** Index of the next piece to send. */
 		int32 NextPiece = 0;
 		/** Waiting for the belt of piece NextPiece-1 to replicate. */
@@ -151,12 +145,15 @@ private:
 	static void OnBeltCheckValidPlacement( AFGConveyorBeltHologram* self );
 	static void OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self );
 	static void OnBeltPlacementHit( AFGConveyorBeltHologram* self, const FHitResult& hit );
+	/** The moment the client turns a hologram into a construction message. Saving side only. */
+	static void OnSerializeConstructMessage( AFGHologram* self, FArchive& ar, FNetConstructionID id );
 	static void OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id );
-	static void OnAfterInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id );
 
+	/** The build gun's build state for the player who owns the hologram. */
+	static UFGBuildGunStateBuild* FindBuildState( AFGHologram* hologram );
 	/** Cut the belt's full curve into equal pieces under the limit. Leaves the hologram on piece 0. */
-	static bool PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState, FNetConstructionID id );
-	/** Configure the build gun's current hologram as the next piece and construct it. */
+	static bool PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState );
+	/** Configure the build gun's current hologram as the next piece and have the build gun build it. */
 	static void SendNextPiece();
 	static bool TickChain( float deltaTime );
 	static void AbortChain( const TCHAR* reason );

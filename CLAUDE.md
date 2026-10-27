@@ -145,12 +145,17 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   for a chain candidate, so the full hologram shows valid (everything else vanilla found stands).
 - Pre-hooks on `TrySnapToActor` / `SetHologramLocationAndRotation` record the last cursor hit per
   belt hologram (`sLastHit`).
-- Pre-hook on `UFGBuildGunStateBuild::InternalConstructHologram` (the client call that serialises
-  the hologram and sends `Server_ConstructHologram`): for a chain candidate, `PlanChain` cuts the
-  curve into N equal pieces with `SplitSplineAtDistance` (reusing the hologram's spline component
-  for each remainder), reshapes the hologram into piece 0 (end snap cleared, joint handled by
-  `SeatOrDisableEndPole`), re-validates it and lets vanilla send it. `sDriverBusy` makes the
-  placement hooks stand aside while the driver touches a hologram; an after-hook clears it.
+- Pre-hook on `AFGHologram::SerializeConstructMessage` (saving side only; the server and the
+  client's pending-construction copy load through the same function): this is the moment the
+  client turns the hologram into the construction message. For a chain candidate, `PlanChain`
+  cuts the curve into N equal pieces with `SplitSplineAtDistance` (reusing the hologram's spline
+  component for each remainder), reshapes the hologram into piece 0 (end snap cleared, joint
+  handled by `SeatOrDisableEndPole`), re-validates it and lets vanilla serialise and send it.
+  `sDriverBusy` makes the placement hooks stand aside while the driver touches a hologram.
+  First attempt hooked `UFGBuildGunStateBuild::InternalConstructHologram` instead: in-game it
+  never saw the long hologram (the build gun already held a fresh one), so vanilla sent the full
+  belt, the server refused it and the pending hologram vanished. A Verbose `[diag]` line on that
+  function remains to document its position in the flow.
 - `TickChain` (core ticker) waits for the previous piece's belt to replicate: it scans
   `AFGBuildableConveyorBelt` actors for one whose connection0/1 are within 25 cm of the piece's
   ends, 10 s timeout. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
@@ -160,8 +165,10 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   - final piece: `TrySnapToActor(EndHit)` then `SetHologramLocationAndRotation(EndHit)` so vanilla
     recreates the end the player aimed at (pole, wall/ceiling mount, or snapped machine), then the
     piece's curve is put back under it;
-  then `ValidatePlacementAndCost`, and `InternalConstructHologram` with the first piece's
-  `FNetConstructionID` whose `Client_ID` is moved up by 10000 + i (collision avoidance only).
+  then `ValidatePlacementAndCost`, `mBuildStep = SHBS_AdjustPole` and
+  `UFGBuildGunStateBuild::PrimaryFire()`: vanilla treats it as the player's final click, assigns
+  the construction ID, serialises (the hook stands aside), sends and spawns a fresh hologram. If
+  the build gun still holds the same hologram afterwards, nothing went out and the chain aborts.
 - Abort (log Warning, leave the partial run) on: timeout, hologram gone or recipe changed, previous
   belt gone, piece not constructible (disqualifier names are logged).
 - Not yet: chaining for pipes and tracks (they still trim, phase 1), a preview of the joint

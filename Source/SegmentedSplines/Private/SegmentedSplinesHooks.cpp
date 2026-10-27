@@ -13,6 +13,7 @@
 #include "Hologram/HologramHelpers.h"
 #include "Buildables/FGBuildablePole.h"
 #include "Buildables/FGBuildableConveyorBelt.h"
+#include "Equipment/FGBuildGun.h"
 #include "Equipment/FGBuildGunBuild.h"
 #include "FGCharacterPlayer.h"
 #include "FGConstructDisqualifier.h"
@@ -74,17 +75,21 @@ void FSegmentedSplinesHooks::RegisterHooks()
 			OnBeltPlacementHit( self, hitResult );
 		} );
 
-	// The moment the player builds. For a chainable belt this reshapes the hologram into piece 0
-	// before vanilla serialises and sends it, and starts the driver for the rest.
+	// The moment the player builds: the client serialises the hologram into the construction
+	// message. For a chainable belt this reshapes the hologram into piece 0 right before that
+	// happens, and starts the driver for the rest. The implementation lives on AFGHologram and is
+	// shared by every hologram class, so the handler filters for belts.
+	SUBSCRIBE_UOBJECT_METHOD( AFGHologram, SerializeConstructMessage,
+		[]( auto& scope, AFGHologram* self, FArchive& ar, FNetConstructionID id )
+		{
+			OnSerializeConstructMessage( self, ar, id );
+		} );
+
+	// Diagnostics only: learn where this sits in the click flow relative to serialisation.
 	SUBSCRIBE_METHOD( UFGBuildGunStateBuild::InternalConstructHologram,
 		[]( auto& scope, UFGBuildGunStateBuild* self, FNetConstructionID clientNetConstructID )
 		{
 			OnInternalConstructHologram( self, clientNetConstructID );
-		} );
-	SUBSCRIBE_METHOD_AFTER( UFGBuildGunStateBuild::InternalConstructHologram,
-		[]( UFGBuildGunStateBuild* self, FNetConstructionID clientNetConstructID )
-		{
-			OnAfterInternalConstructHologram( self, clientNetConstructID );
 		} );
 
 	SUBSCRIBE_UOBJECT_METHOD( AFGRailroadTrackHologram, CheckValidPlacement,
@@ -184,12 +189,19 @@ void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, 
 
 void FSegmentedSplinesHooks::OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id )
 {
-	if( sDriverBusy )
+	AFGHologram* hologram = self ? self->GetHologram() : nullptr;
+	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[diag] InternalConstructHologram id=%s, build gun hologram is %s" ),
+		*id.ToString(), hologram ? *hologram->GetClass()->GetName() : TEXT( "null" ) );
+}
+
+void FSegmentedSplinesHooks::OnSerializeConstructMessage( AFGHologram* self, FArchive& ar, FNetConstructionID id )
+{
+	// Loading happens on the server and on the client's pending-construction copy; neither is ours.
+	if( !ar.IsSaving() || sDriverBusy )
 	{
-		// The driver itself constructing a piece; let it through untouched.
 		return;
 	}
-	AFGConveyorBeltHologram* belt = Cast< AFGConveyorBeltHologram >( self ? self->GetHologram() : nullptr );
+	AFGConveyorBeltHologram* belt = Cast< AFGConveyorBeltHologram >( self );
 	if( !IsChainCandidate( belt ) )
 	{
 		return;
@@ -198,21 +210,27 @@ void FSegmentedSplinesHooks::OnInternalConstructHologram( UFGBuildGunStateBuild*
 	{
 		AbortChain( TEXT( "a new build started while a chain was still running" ) );
 	}
-	// Everything from here until the after-hook clears the flag happens with the placement hooks
-	// standing aside, so re-validating the reshaped hologram cannot undo what we set up.
-	sDriverBusy = true;
-	if( !PlanChain( belt, self, id ) )
+	UFGBuildGunStateBuild* buildState = FindBuildState( belt );
+	if( !buildState )
 	{
-		sDriverBusy = false;
+		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] could not find the build gun's build state; sending the full belt as vanilla would" ) );
+		return;
 	}
-}
-
-void FSegmentedSplinesHooks::OnAfterInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id )
-{
+	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] construction message %s being built, reshaping into piece 1" ), *id.ToString() );
+	// While the hologram is reshaped and re-validated the placement hooks stand aside.
+	sDriverBusy = true;
+	PlanChain( belt, buildState );
 	sDriverBusy = false;
 }
 
-bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState, FNetConstructionID id )
+UFGBuildGunStateBuild* FSegmentedSplinesHooks::FindBuildState( AFGHologram* hologram )
+{
+	AFGCharacterPlayer* player = Cast< AFGCharacterPlayer >( hologram->GetConstructionInstigator() );
+	AFGBuildGun* buildGun = player ? player->GetBuildGun() : nullptr;
+	return buildGun ? Cast< UFGBuildGunStateBuild >( buildGun->GetBuildGunStateFor( EBuildGunState::BGS_BUILD ) ) : nullptr;
+}
+
+bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState )
 {
 	USplineComponent* spline = belt->mSplineComponent;
 	const float maxLength = belt->mMaxSplineLength;
@@ -225,7 +243,6 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 	plan->World = belt->GetWorld();
 	plan->Recipe = belt->GetRecipe();
 	plan->Frame = belt->GetActorTransform();
-	plan->BaseId = id;
 	if( const FHitResult* hit = sLastHit.Find( belt ) )
 	{
 		plan->EndHit = *hit;
@@ -444,8 +461,10 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		return;
 	}
 
-	FNetConstructionID pieceId = plan.BaseId;
-	pieceId.Client_ID = static_cast< uint16 >( plan.BaseId.Client_ID + kChainIdOffset + i );
+	// Hand the finished hologram to the build gun as if the player had clicked on the last step:
+	// vanilla assigns the construction ID, serialises (our hook stands aside), sends, shows the
+	// pending copy and spawns a fresh hologram for whatever comes next.
+	holo->mBuildStep = ESplineHologramBuildStep::SHBS_AdjustPole;
 
 	if( bFinal )
 	{
@@ -462,10 +481,15 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	}
 
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
-	// Vanilla serialises the hologram, sends it, shows the pending copy and spawns a fresh hologram.
-	// The after-hook clears sDriverBusy.
-	buildState->InternalConstructHologram( pieceId );
+	buildState->PrimaryFire();
 	sDriverBusy = false;
+
+	// A send replaces the build gun's hologram with a fresh one. If it is still ours, the build gun
+	// did not accept the click as a final step and nothing went out.
+	if( sChain && buildState->GetHologram() == holo )
+	{
+		AbortChain( TEXT( "the build gun did not construct the piece on PrimaryFire (hologram unchanged)" ) );
+	}
 }
 
 void FSegmentedSplinesHooks::AbortChain( const TCHAR* reason )

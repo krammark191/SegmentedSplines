@@ -18,6 +18,7 @@ class AFGBuildableConveyorBelt;
 class UFGBuildGunStateBuild;
 class UFGRecipe;
 class FArchive;
+class IFGConstructionMessageInterface;
 
 /**
  * Segmented Splines.
@@ -141,13 +142,17 @@ private:
 	/** True while the chain driver is configuring or constructing a piece; the placement hooks stand aside. */
 	static bool sDriverBusy;
 
-	static bool IsChainCandidate( AFGConveyorBeltHologram* belt );
+	/** @param bRequireDragStep  true while validating (the player is still dragging); false at build time. */
+	static bool IsChainCandidate( AFGConveyorBeltHologram* belt, bool bRequireDragStep );
 	static void OnBeltCheckValidPlacement( AFGConveyorBeltHologram* self );
 	static void OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self );
 	static void OnBeltPlacementHit( AFGConveyorBeltHologram* self, const FHitResult& hit );
-	/** The moment the client turns a hologram into a construction message. Saving side only. */
-	static void OnSerializeConstructMessage( AFGHologram* self, FArchive& ar, FNetConstructionID id );
-	static void OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id );
+	/** The player's click was accepted as the final placement step; vanilla serialises and sends next. */
+	static void OnBeltAfterMultiStepPlacement( bool bFinalStep, AFGConveyorBeltHologram* self );
+	/** The client turns a hologram into a construction message (also runs on loading; fallback trigger). */
+	static void OnSerializeConstructMessage( IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id );
+	/** Reshape a chainable belt into piece 0 and start the driver, once. */
+	static void StartChain( AFGConveyorBeltHologram* belt, const TCHAR* trigger );
 
 	/** The build gun's build state for the player who owns the hologram. */
 	static UFGBuildGunStateBuild* FindBuildState( AFGHologram* hologram );

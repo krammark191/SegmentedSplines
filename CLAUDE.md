@@ -145,17 +145,20 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   for a chain candidate, so the full hologram shows valid (everything else vanilla found stands).
 - Pre-hooks on `TrySnapToActor` / `SetHologramLocationAndRotation` record the last cursor hit per
   belt hologram (`sLastHit`).
-- Pre-hook on `AFGHologram::SerializeConstructMessage` (saving side only; the server and the
-  client's pending-construction copy load through the same function): this is the moment the
-  client turns the hologram into the construction message. For a chain candidate, `PlanChain`
-  cuts the curve into N equal pieces with `SplitSplineAtDistance` (reusing the hologram's spline
-  component for each remainder), reshapes the hologram into piece 0 (end snap cleared, joint
-  handled by `SeatOrDisableEndPole`), re-validates it and lets vanilla serialise and send it.
-  `sDriverBusy` makes the placement hooks stand aside while the driver touches a hologram.
-  First attempt hooked `UFGBuildGunStateBuild::InternalConstructHologram` instead: in-game it
-  never saw the long hologram (the build gun already held a fresh one), so vanilla sent the full
-  belt, the server refused it and the pending hologram vanished. A Verbose `[diag]` line on that
-  function remains to document its position in the flow.
+- Trigger: after-hook on `AFGConveyorBeltHologram::DoMultiStepPlacement`. A true result is the
+  build gun accepting the click as the final step; it serialises and sends right after, so the
+  hologram is reshaped into piece 0 in between (`StartChain` -> `PlanChain`: cut the curve into
+  N equal pieces with `SplitSplineAtDistance`, reusing the hologram's spline component for each
+  remainder; piece 0 keeps the player's start, end snap cleared, joint via `SeatOrDisableEndPole`,
+  re-validated). Fallback trigger plus diagnostics: `IFGConstructionMessageInterface::
+  SerializeConstructMessage` hooked through the interface type (`SUBSCRIBE_METHOD_VIRTUAL` with
+  the belt CDO cast to the interface). Hooking it as `AFGHologram::SerializeConstructMessage`
+  installs but hands the handler the interface subobject (SML logs "This adjustment: 0x2b0"),
+  which is why the second attempt was silent in-game. `sDriverBusy` makes the placement hooks
+  stand aside while the driver touches a hologram. At build time only the length is checked,
+  not the build step. Both triggers log a `[diag]` line at Log level on every call.
+  Dead end: `UFGBuildGunStateBuild::InternalConstructHologram` is never called on the client
+  (it is the server half); a hook there sees nothing.
 - `TickChain` (core ticker) waits for the previous piece's belt to replicate: it scans
   `AFGBuildableConveyorBelt` actors for one whose connection0/1 are within 25 cm of the piece's
   ends, 10 s timeout. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last

@@ -18,6 +18,7 @@
 #include "FGCharacterPlayer.h"
 #include "FGConstructDisqualifier.h"
 #include "FGFactoryConnectionComponent.h"
+#include "FGConstructionMessageInterface.h"
 
 #include "Components/SplineComponent.h"
 #include "CollisionQueryParams.h"
@@ -75,21 +76,24 @@ void FSegmentedSplinesHooks::RegisterHooks()
 			OnBeltPlacementHit( self, hitResult );
 		} );
 
-	// The moment the player builds: the client serialises the hologram into the construction
-	// message. For a chainable belt this reshapes the hologram into piece 0 right before that
-	// happens, and starts the driver for the rest. The implementation lives on AFGHologram and is
-	// shared by every hologram class, so the handler filters for belts.
-	SUBSCRIBE_UOBJECT_METHOD( AFGHologram, SerializeConstructMessage,
-		[]( auto& scope, AFGHologram* self, FArchive& ar, FNetConstructionID id )
+	// The moment the player builds. DoMultiStepPlacement returning true is the build gun accepting
+	// the click as the final step; it serialises and sends the hologram right after. For a chainable
+	// belt the hologram is reshaped into piece 0 in between, and the driver takes over the rest.
+	SUBSCRIBE_UOBJECT_METHOD_AFTER( AFGConveyorBeltHologram, DoMultiStepPlacement,
+		[]( bool bFinalStep, AFGConveyorBeltHologram* self, bool isInputFromARelease )
 		{
-			OnSerializeConstructMessage( self, ar, id );
+			OnBeltAfterMultiStepPlacement( bFinalStep, self );
 		} );
 
-	// Diagnostics only: learn where this sits in the click flow relative to serialisation.
-	SUBSCRIBE_METHOD( UFGBuildGunStateBuild::InternalConstructHologram,
-		[]( auto& scope, UFGBuildGunStateBuild* self, FNetConstructionID clientNetConstructID )
+	// Fallback trigger and diagnostics: the serialisation itself. The function is introduced by
+	// IFGConstructionMessageInterface, so it is hooked through that type: the implementation is
+	// entered with the interface subobject as `this`, and a handler typed on AFGHologram would be
+	// handed a pointer 0x2b0 bytes into the object (SML logs that adjustment at install).
+	SUBSCRIBE_METHOD_VIRTUAL( IFGConstructionMessageInterface::SerializeConstructMessage,
+		static_cast< const IFGConstructionMessageInterface* >( GetDefault< AFGConveyorBeltHologram >() ),
+		[]( auto& scope, IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id )
 		{
-			OnInternalConstructHologram( self, clientNetConstructID );
+			OnSerializeConstructMessage( self, ar, id );
 		} );
 
 	SUBSCRIBE_UOBJECT_METHOD( AFGRailroadTrackHologram, CheckValidPlacement,
@@ -125,14 +129,14 @@ FSegmentedSplinesHooks::FEndSupports FSegmentedSplinesHooks::GetBeltSupports( AF
 	return supports;
 }
 
-bool FSegmentedSplinesHooks::IsChainCandidate( AFGConveyorBeltHologram* belt )
+bool FSegmentedSplinesHooks::IsChainCandidate( AFGConveyorBeltHologram* belt, bool bRequireDragStep )
 {
 	if( !belt || sDriverBusy || !belt->IsLocalHologram() )
 	{
 		return false;
 	}
 	const ESplineHologramBuildStep step = belt->GetCurrentBuildStep();
-	if( step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding && step != ESplineHologramBuildStep::SHBS_AdjustPole )
+	if( bRequireDragStep && step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding && step != ESplineHologramBuildStep::SHBS_AdjustPole )
 	{
 		return false;
 	}
@@ -165,7 +169,7 @@ void FSegmentedSplinesHooks::OnBeltCheckValidPlacement( AFGConveyorBeltHologram*
 
 void FSegmentedSplinesHooks::OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self )
 {
-	if( !IsChainCandidate( self ) )
+	if( !IsChainCandidate( self, true ) )
 	{
 		return;
 	}
@@ -187,22 +191,43 @@ void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, 
 	}
 }
 
-void FSegmentedSplinesHooks::OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id )
+void FSegmentedSplinesHooks::OnBeltAfterMultiStepPlacement( bool bFinalStep, AFGConveyorBeltHologram* self )
 {
-	AFGHologram* hologram = self ? self->GetHologram() : nullptr;
-	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[diag] InternalConstructHologram id=%s, build gun hologram is %s" ),
-		*id.ToString(), hologram ? *hologram->GetClass()->GetName() : TEXT( "null" ) );
-}
-
-void FSegmentedSplinesHooks::OnSerializeConstructMessage( AFGHologram* self, FArchive& ar, FNetConstructionID id )
-{
-	// Loading happens on the server and on the client's pending-construction copy; neither is ours.
-	if( !ar.IsSaving() || sDriverBusy )
+	if( !self || sDriverBusy || !self->IsLocalHologram() )
 	{
 		return;
 	}
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)" ),
+		bFinalStep ? TEXT( "final" ) : TEXT( "more steps" ), static_cast< int32 >( self->GetCurrentBuildStep() ),
+		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, self->mMaxSplineLength );
+	if( bFinalStep )
+	{
+		StartChain( self, TEXT( "DoMultiStepPlacement" ) );
+	}
+}
+
+void FSegmentedSplinesHooks::OnSerializeConstructMessage( IFGConstructionMessageInterface* self, FArchive& ar, FNetConstructionID id )
+{
 	AFGConveyorBeltHologram* belt = Cast< AFGConveyorBeltHologram >( self );
-	if( !IsChainCandidate( belt ) )
+	if( !belt )
+	{
+		return;
+	}
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] SerializeConstructMessage %s id=%s, step %d, length %.0f, local %d, driver busy %d" ),
+		ar.IsSaving() ? TEXT( "saving" ) : TEXT( "loading" ), *id.ToString(), static_cast< int32 >( belt->GetCurrentBuildStep() ),
+		belt->mSplineComponent ? belt->mSplineComponent->GetSplineLength() : -1.f, belt->IsLocalHologram() ? 1 : 0, sDriverBusy ? 1 : 0 );
+	// Loading happens on the server and on the client's pending-construction copy; neither is ours.
+	if( ar.IsSaving() && !sDriverBusy )
+	{
+		StartChain( belt, TEXT( "SerializeConstructMessage" ) );
+	}
+}
+
+void FSegmentedSplinesHooks::StartChain( AFGConveyorBeltHologram* belt, const TCHAR* trigger )
+{
+	// At build time the step no longer matters; only the length does. Once piece 0 is in place
+	// the belt is under the limit, so a second trigger for the same build is a no-op.
+	if( !IsChainCandidate( belt, false ) )
 	{
 		return;
 	}
@@ -216,7 +241,7 @@ void FSegmentedSplinesHooks::OnSerializeConstructMessage( AFGHologram* self, FAr
 		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] could not find the build gun's build state; sending the full belt as vanilla would" ) );
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] construction message %s being built, reshaping into piece 1" ), *id.ToString() );
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] build accepted (%s), reshaping into piece 1" ), trigger );
 	// While the hologram is reshaped and re-validated the placement hooks stand aside.
 	sDriverBusy = true;
 	PlanChain( belt, buildState );

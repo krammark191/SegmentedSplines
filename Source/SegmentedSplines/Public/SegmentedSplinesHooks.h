@@ -16,6 +16,7 @@ class AFGBuildable;
 class UFGConnectionComponent;
 class UFGBuildGunStateBuild;
 class UFGRecipe;
+class UStaticMeshComponent;
 class FArchive;
 class IFGConstructionMessageInterface;
 
@@ -35,6 +36,11 @@ class IFGConstructionMessageInterface;
  * support (pole, wall or ceiling mount, or a snapped connection); the joints in between get a
  * ground pole if there is a floor in reach below them and are left free otherwise (tracks have no
  * supports at all).
+ *
+ * While the player is still dragging, the joints the chain would make are previewed: a pole mesh
+ * of the height the build would pick stands under each joint that has floor in reach, wearing the
+ * hologram's own material, so the player sees the supports before clicking. Joints over nothing
+ * show nothing, as the built end will be free there.
  *
  * Disabling a support uses the same switch vanilla flips when a belt end snaps to a machine
  * (mIsDisabled, which is in the construction message), so the server sees the same thing.
@@ -143,6 +149,12 @@ private:
 		TWeakObjectPtr< UFGConnectionComponent > JointConnection;
 	};
 
+	/** Preview meshes standing at the joints of one hologram, one slot per joint (null where free). */
+	struct FJointPreview
+	{
+		TArray< TWeakObjectPtr< UStaticMeshComponent > > Meshes;
+	};
+
 	// --- per-type knowledge --------------------------------------------------------------------
 
 	static const FSplineKind* FindKind( const AFGHologram* hologram );
@@ -210,6 +222,17 @@ private:
 	static float SeatOrDisableEndPole( AFGSplineHologram* hologram, const FSplineKind* kind, float cutDistance,
 		const FEndSupports& supports, const TCHAR* debugName );
 
+	/** Trace straight down from a point on the build gun's channel, ignoring the hologram, its
+	 *  children and the player. True if a floor (not steeper than kMinFloorNormalZ) is within maxDepth. */
+	static bool FindFloorBelow( AFGSplineHologram* hologram, const FVector& point, float maxDepth, FHitResult& outHit );
+
+	// --- joint preview -------------------------------------------------------------------------
+
+	/** Show a pole mesh under each joint the chain would make, as the build would seat it. */
+	static void UpdateJointPreview( AFGSplineHologram* hologram, const FSplineKind* kind );
+	/** Remove the preview meshes of one hologram (and forget holograms that are gone). */
+	static void ClearJointPreview( AFGHologram* hologram );
+
 	/** Disable a support hologram and remember that it was us, not vanilla, who did it. */
 	static void DisableSupport( AFGHologram* support );
 	/** Re-enable any of the given supports that we disabled earlier. */
@@ -224,5 +247,7 @@ private:
 	/** Last cursor hit each hologram was placed with; the chain's final piece is placed with it again. */
 	static TMap< TWeakObjectPtr< AFGHologram >, FHitResult > sLastHit;
 	static TUniquePtr< FChainPlan > sChain;
+	/** Joint previews per hologram being dragged. Components die with their hologram; entries are pruned. */
+	static TMap< TWeakObjectPtr< AFGHologram >, FJointPreview > sPreviews;
 	static FTSTicker::FDelegateHandle sTicker;
 };

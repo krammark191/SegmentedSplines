@@ -70,6 +70,8 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   built fine untouched. The crash folder from the end of that session is the crash reporter
   firing on a normal quit (`RequestExit` from the exit command, clean `LogExit` shutdown).
   User confirmed after the fix (2026-10-27): "It works as intended now."
+- **Joint-support preview added (2026-10-27, not yet seen in-game).** Pole meshes now stand
+  under the planned joints while the player drags a chain candidate; see the Phase 2 section.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -283,8 +285,23 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   `Client_OnBuildableFailedConstruction` RPC for the pending ID (hooked on its `_Implementation`
   through the build state CDO), hologram gone or recipe changed, previous belt gone, piece not
   constructible (disqualifier names are logged).
-- Not yet: a preview of the joint supports along the full hologram (the user asked for it; the
-  full curve itself is shown by vanilla).
+- Joint preview (written 2026-10-27, not yet seen in-game): while the full hologram is a chain
+  candidate, `OnAfterCheckValidPlacement` calls `UpdateJointPreview`, which computes the N-1
+  joint points along `mSplineComponent` (same cut as `PlanChain`), runs the same floor trace
+  and fixed-height choice as `SeatOrDisableEndPole` (shared `FindFloorBelow`), and for each
+  joint with floor in reach shows a `UStaticMeshComponent` owned by and attached to the spline
+  hologram, with the `FPoleVariation` mesh of the chosen height, the material of the far-end
+  pole hologram's `GetPoleMesh()` (fallback `mValidPlacementMaterial`), vanilla's
+  `ApplyHologramMaterialOverrides`, and the pole mesh's custom-depth stencil copied each pass
+  (that is what colours a hologram valid / invalid). No collision, no shadow, transient. Joints
+  over nothing show nothing. Meshes are reused across passes, extras destroyed when N shrinks,
+  all cleared when the hologram drops under the limit (`ClearJointPreview` from the after-hook)
+  and in `StartChain` before the reshape; a destroyed hologram takes its components with it and
+  the `sPreviews` entry is pruned on the next clear. Tracks get no preview (no pole class).
+  Guesses: that extra mesh components on a hologram actor upset nothing in vanilla (its
+  clearance uses `mClearanceData`, the construct message does not carry components), and that
+  the pole mesh's relative transform composed with (floor point, curve yaw) is where vanilla's
+  seated pole appears.
 
 Everything above about vanilla's internals (what InternalConstructHologram checks, whether
 SetHologramLocationAndRotation on a fresh hologram in PlacePoleOrSnapEnding needs more start state

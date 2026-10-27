@@ -27,6 +27,10 @@
 #include "FGConstructionMessageInterface.h"
 
 #include "Components/SplineComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstance.h"
 #include "CollisionQueryParams.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -35,6 +39,7 @@
 TSet< TWeakObjectPtr< AFGHologram > > FSegmentedSplinesHooks::sDisabledByUs;
 TMap< TWeakObjectPtr< AFGHologram >, FHitResult > FSegmentedSplinesHooks::sLastHit;
 TUniquePtr< FSegmentedSplinesHooks::FChainPlan > FSegmentedSplinesHooks::sChain;
+TMap< TWeakObjectPtr< AFGHologram >, FSegmentedSplinesHooks::FJointPreview > FSegmentedSplinesHooks::sPreviews;
 FTSTicker::FDelegateHandle FSegmentedSplinesHooks::sTicker;
 bool FSegmentedSplinesHooks::sDriverBusy = false;
 
@@ -403,6 +408,7 @@ void FSegmentedSplinesHooks::OnAfterCheckValidPlacement( AFGSplineHologram* self
 	const FSplineKind* kind = FindKind( self );
 	if( !IsChainCandidate( self, kind, true ) )
 	{
+		ClearJointPreview( self );
 		return;
 	}
 	// Vanilla has just judged the full curve too long. Every piece we will send is under the limit,
@@ -413,6 +419,7 @@ void FSegmentedSplinesHooks::OnAfterCheckValidPlacement( AFGSplineHologram* self
 		UE_LOG( LogSegmentedSplines, VeryVerbose, TEXT( "[%s] %.0f cm hologram over the %.0f limit, chainable: cleared TooLong" ),
 			kind->Name, self->mSplineComponent->GetSplineLength(), KindMaxLength( kind, self ) );
 	}
+	UpdateJointPreview( self, kind );
 }
 
 void FSegmentedSplinesHooks::OnPlacementHit( AFGSplineHologram* self, const FHitResult& hit )
@@ -506,6 +513,8 @@ void FSegmentedSplinesHooks::StartChain( AFGSplineHologram* hologram, const FSpl
 		return;
 	}
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %s build accepted (%s), reshaping into piece 1" ), kind->Name, trigger );
+	// The preview poles were only ever a picture; the real ones come with each piece.
+	ClearJointPreview( hologram );
 	// While the hologram is reshaped and re-validated the placement hooks stand aside.
 	sDriverBusy = true;
 	PlanChain( hologram, kind, buildState );
@@ -995,28 +1004,9 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	FVector newEndWorld = hologramTransform.TransformPosition( hologram->mSplineData.Last().Location );
 	const float maxPoleHeight = GetMaxPoleHeight( pole );
 
-	// Straight down from the end, as far as the tallest pole could reach. Same channel as the
-	// build gun, so we see what the player could have aimed at. The hologram, its children and the
-	// player are not floors.
-	FCollisionQueryParams params( SCENE_QUERY_STAT( SegmentedSplinesFloor ), false );
-	params.AddIgnoredActor( hologram );
-	for( AFGHologram* child : hologram->GetHologramChildren() )
-	{
-		if( child ) params.AddIgnoredActor( child );
-	}
-	if( APawn* instigator = hologram->GetConstructionInstigator() )
-	{
-		params.AddIgnoredActor( instigator );
-	}
-
-	const FVector traceStart = newEndWorld + FVector( 0.f, 0.f, kTraceStartLift );
-	const FVector traceEnd = newEndWorld - FVector( 0.f, 0.f, maxPoleHeight + kMaxPoleSeatNudge );
-
+	// Straight down from the end, as far as the tallest pole could reach.
 	FHitResult hit;
-	UWorld* world = hologram->GetWorld();
-	const bool hasFloor = world
-		&& world->LineTraceSingleByChannel( hit, traceStart, traceEnd, kBuildGunTraceChannel, params )
-		&& hit.ImpactNormal.Z >= kMinFloorNormalZ;
+	const bool hasFloor = FindFloorBelow( hologram, newEndWorld, maxPoleHeight + kMaxPoleSeatNudge, hit );
 
 	if( !hasFloor )
 	{
@@ -1121,6 +1111,161 @@ void FSegmentedSplinesHooks::RestoreSupports( const FEndSupports& supports )
 	for( auto it = sDisabledByUs.CreateIterator(); it; ++it )
 	{
 		if( !it->IsValid() ) it.RemoveCurrent();
+	}
+}
+
+bool FSegmentedSplinesHooks::FindFloorBelow( AFGSplineHologram* hologram, const FVector& point, float maxDepth, FHitResult& outHit )
+{
+	// Same channel as the build gun, so we see what the player could have aimed at. The hologram,
+	// its children and the player are not floors.
+	FCollisionQueryParams params( SCENE_QUERY_STAT( SegmentedSplinesFloor ), false );
+	params.AddIgnoredActor( hologram );
+	for( AFGHologram* child : hologram->GetHologramChildren() )
+	{
+		if( child ) params.AddIgnoredActor( child );
+	}
+	if( APawn* instigator = hologram->GetConstructionInstigator() )
+	{
+		params.AddIgnoredActor( instigator );
+	}
+	UWorld* world = hologram->GetWorld();
+	return world
+		&& world->LineTraceSingleByChannel( outHit, point + FVector( 0.f, 0.f, kTraceStartLift ), point - FVector( 0.f, 0.f, maxDepth ),
+			kBuildGunTraceChannel, params )
+		&& outHit.ImpactNormal.Z >= kMinFloorNormalZ;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Joint preview
+// ---------------------------------------------------------------------------------------------
+
+void FSegmentedSplinesHooks::UpdateJointPreview( AFGSplineHologram* hologram, const FSplineKind* kind )
+{
+	// The pole that would stand at a joint is the same kind vanilla puts under the far end, so the
+	// far end's pole hologram is the template: its buildable class lists the fixed heights and
+	// their meshes, and its mesh wears the hologram material. Tracks have no pole: nothing to show.
+	AFGPoleHologram* pole = KindSupports( kind, hologram, 1 ).Pole;
+	if( !pole )
+	{
+		pole = KindSupports( kind, hologram, 0 ).Pole;
+	}
+	const AFGBuildablePole* poleCdo = nullptr;
+	if( pole )
+	{
+		if( UClass* buildClass = pole->GetBuildClass() )
+		{
+			poleCdo = Cast< AFGBuildablePole >( buildClass->GetDefaultObject() );
+		}
+	}
+	USplineComponent* spline = hologram->mSplineComponent;
+	if( !pole || !poleCdo || poleCdo->GetPoleVariations().Num() == 0 || !spline || !hologram->GetRootComponent() )
+	{
+		ClearJointPreview( hologram );
+		return;
+	}
+
+	// Same cut as PlanChain will make.
+	const float maxLength = KindMaxLength( kind, hologram );
+	const float totalLength = spline->GetSplineLength();
+	const int32 numPieces = FMath::CeilToInt( totalLength / ( maxLength - kSafetyMargin ) );
+	const float pieceLength = totalLength / numPieces;
+	const float maxPoleHeight = GetMaxPoleHeight( pole );
+
+	UStaticMeshComponent* source = pole->GetPoleMesh();
+	UMaterialInterface* material = ( source && source->GetNumMaterials() > 0 ) ? source->GetMaterial( 0 ) : nullptr;
+	if( !material )
+	{
+		material = hologram->mValidPlacementMaterial;
+	}
+
+	FJointPreview& preview = sPreviews.FindOrAdd( hologram );
+	for( int32 i = numPieces - 1; i < preview.Meshes.Num(); ++i )
+	{
+		if( UStaticMeshComponent* extra = preview.Meshes[ i ].Get() )
+		{
+			extra->DestroyComponent();
+		}
+	}
+	preview.Meshes.SetNum( numPieces - 1 );
+
+	for( int32 joint = 1; joint < numPieces; ++joint )
+	{
+		const float distance = joint * pieceLength;
+		const FVector point = spline->GetLocationAtDistanceAlongSpline( distance, ESplineCoordinateSpace::World );
+		TWeakObjectPtr< UStaticMeshComponent >& slot = preview.Meshes[ joint - 1 ];
+		UStaticMeshComponent* mesh = slot.Get();
+
+		// Same decision as SeatOrDisableEndPole: floor in reach and a fixed height close enough.
+		FHitResult hit;
+		const FPoleVariation* variation = nullptr;
+		if( FindFloorBelow( hologram, point, maxPoleHeight + kMaxPoleSeatNudge, hit ) )
+		{
+			variation = poleCdo->GetBestPoleVariationForHeight( point.Z - hit.ImpactPoint.Z );
+			if( variation && FMath::Abs( ( hit.ImpactPoint.Z + variation->Height ) - point.Z ) > kMaxPoleSeatNudge )
+			{
+				variation = nullptr;
+			}
+		}
+		if( !variation || !variation->StaticMesh )
+		{
+			if( mesh )
+			{
+				mesh->SetVisibility( false );
+			}
+			continue;
+		}
+
+		if( !mesh )
+		{
+			// Owned by the hologram, so it disappears with it. Never collides: it is a picture.
+			mesh = NewObject< UStaticMeshComponent >( hologram, NAME_None, RF_Transient );
+			mesh->SetCollisionEnabled( ECollisionEnabled::NoCollision );
+			mesh->SetCastShadow( false );
+			mesh->RegisterComponent();
+			mesh->AttachToComponent( hologram->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform );
+			slot = mesh;
+		}
+		if( mesh->GetStaticMesh() != variation->StaticMesh )
+		{
+			mesh->SetStaticMesh( variation->StaticMesh );
+			for( int32 i = 0; i < mesh->GetNumMaterials(); ++i )
+			{
+				mesh->SetMaterial( i, material );
+			}
+			UFGHologramMaterialOverrideIdentifier::ApplyHologramMaterialOverrides( mesh );
+		}
+		if( source )
+		{
+			// The hologram's colour (valid / invalid) is a stencil value; follow the real pole's.
+			mesh->SetRenderCustomDepth( source->bRenderCustomDepth );
+			mesh->SetCustomDepthStencilValue( source->CustomDepthStencilValue );
+		}
+
+		// On the floor, under the joint, facing along the curve: where SeatOrDisableEndPole puts it.
+		const FVector direction = spline->GetDirectionAtDistanceAlongSpline( distance, ESplineCoordinateSpace::World ).GetSafeNormal2D();
+		const FRotator rotation( 0.f, direction.IsNearlyZero() ? 0.f : direction.Rotation().Yaw, 0.f );
+		const FTransform poleTransform( rotation, hit.ImpactPoint );
+		mesh->SetWorldTransform( source ? source->GetRelativeTransform() * poleTransform : poleTransform );
+		mesh->SetVisibility( true );
+	}
+}
+
+void FSegmentedSplinesHooks::ClearJointPreview( AFGHologram* hologram )
+{
+	if( FJointPreview* preview = sPreviews.Find( hologram ) )
+	{
+		for( TWeakObjectPtr< UStaticMeshComponent >& slot : preview->Meshes )
+		{
+			if( UStaticMeshComponent* mesh = slot.Get() )
+			{
+				mesh->DestroyComponent();
+			}
+		}
+		sPreviews.Remove( hologram );
+	}
+	for( auto it = sPreviews.CreateIterator(); it; ++it )
+	{
+		if( !it->Key.IsValid() ) it.RemoveCurrent();
 	}
 }
 

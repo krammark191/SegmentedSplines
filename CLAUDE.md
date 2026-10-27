@@ -5,12 +5,22 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
 
 ## Status
 
-- Everything in this repo is an **uncompiled draft**. No file has ever been through UBT.
-  Expect the first build to surface small errors (includes, access, signatures). Fix them here.
+- **First build passed (2026-10-26, Linux PC).** `FactoryEditor Linux Development` against engine
+  5.6.1-css-83 compiled and linked `libUnrealEditor-SegmentedSplines.so` with no errors or
+  warnings on the first pass; the `AccessTransformers.ini` Friend entries took effect. Debug
+  symbols show all three hook lambdas and `TruncateIfTooLong` present. Still unverified: the
+  Win64 Shipping package that the Proton game actually runs (Alpakit, README step 8) and every
+  in-game behaviour in the test plan.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
   SatisfactoryModLoader starter project at `Mods/SegmentedSplines`.
+- Linux PC layout: starter project `~/Projects/SatisfactoryModLoader` (master), engine
+  `~/UnrealEngineCSS` registered as `UE_5.6.1-CSS`, MSVC via msvc-wine at `~/msvc`
+  (`UE_WINE_MSVC`), Wwise SDK cached by `~/tools/wwise-cli`. Build the editor with
+  `~/UnrealEngineCSS/Engine/Build/BatchFiles/Linux/Build.sh FactoryEditor Linux Development -project=<starter>/FactoryGame.uproject`
+  (about 7 min incremental); a Makefile exists at the starter root (`make FactoryEditor`).
+  The Wwise authoring project was never created; the editor's soundbank notice is expected.
 
 ## What the mod is for (user's words, condensed)
 

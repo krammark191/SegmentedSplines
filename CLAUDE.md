@@ -72,8 +72,20 @@ SML facts (verified in docs):
 - If `mSplineComponent->GetSplineLength() > limit`: call the game's own
   `FSplineUtils::SplitSplineAtDistance(spline, limit - 2cm, first, second)` (declared in
   `Hologram/HologramHelpers.h`, used by the game for belt welding / blueprint splitting; it
-  preserves tangents), set `mSplineData = first`, call `UpdateSplineComponent()`, and shift the
-  end-pole child hologram by the same delta as the belt end moved. Vanilla validation then passes.
+  preserves tangents), set `mSplineData = first`, call `UpdateSplineComponent()`. Vanilla
+  validation then passes.
+- End support after a trim (belts, pipes): wall/ceiling mount children for the far end are
+  disabled. A line trace on the build gun channel (`ECC_GameTraceChannel5`; `TC_BuildGun` is
+  declared but not defined by the header stubs, so it does not link) goes straight down from the cut end as far as the
+  tallest variation of the pole's buildable class (`AFGBuildablePole::GetPoleVariations`). Floor
+  found (normal.Z >= cos 40 deg): `AFGPoleHologram::SetPoleHeight` picks the closest fixed height,
+  the pole is moved onto the floor under the end and turned by the change in end direction, and
+  the last spline point is nudged vertically onto the pole top (re-trimmed once if that pushed
+  the length over). No floor, or the closest pole height misses by more than 60 cm: the pole is
+  `SetDisabled(true)`, the same switch vanilla uses when a belt end snaps to a machine
+  (`mIsDisabled` is CustomSerialization, so the server sees it too), and the end is left free.
+  Supports we disabled are tracked in a static set and restored only when the drag comes back
+  within the limit; vanilla's own disabling (snapping) is never touched.
 - Skipped when: not local hologram; build step != `SHBS_PlacePoleOrSnapEnding`; far end snapped
   to a connection (`IsConnectionSnapped(true)`), so aiming at a machine input keeps vanilla's
   "too long" rather than leaving a belt floating short of it.
@@ -94,12 +106,13 @@ spline in PostHologramPlacement", which is why PostHologramPlacement is the othe
 2. `FSplinePointData` is **not** in the game headers; it is defined in the CSS-modified engine's
    `Components/SplineComponent.h` (every game header that uses it includes only that + FactoryGame.h).
    Fields used: `Location`, `ArriveTangent`, `LeaveTangent` (confirmed from FGBlueprintFunctionLibrary.cpp usage).
-3. End pole handling is a plain world-offset shift. On sloped ground it will float/sink and it is
-   not re-aimed along the new end tangent. Proper fix: line-trace down from the new end, run the
-   pole hologram's own `SetHologramLocationAndRotation` with that hit, then re-anchor the belt
-   end to the pole's snap connection (`AFGConveyorPoleHologram::GetSnapConnection()`).
-   Belts also have wall/ceiling pole variants (`mChildWallPoleHologram`, `mChildCeilingPoleHologram`)
-   that are currently ignored.
+3. End support (see "How the current hook works"). In-game on a vanilla server the first version
+   (pole shifted blindly) built fine on flat ground and went red over empty air. The current
+   version seats or disables the pole; untested as of writing: (a) whether vanilla's belt
+   validation accepts a disabled pole with nothing snapped (vanilla only ever pairs "disabled"
+   with "snapped"), (b) that the pole's yaw convention survives the delta-yaw carry-over, (c)
+   pipes. If (a) fails, fall back to a support search (trace sideways for a wall mount, walk the
+   cut back to the previous pillar).
 4. `IsLocalHologram()` is protected on `AFGHologram`; `AFGHologram` is in the Friend list for that.
 5. Rail limit `mMaxLength` is set in Blueprint defaults (no C++ default); belts/pipes default 5600.1 cm.
 6. Everything about the vanilla `.cpp` flow is inferred from headers + comments; the SML repo only

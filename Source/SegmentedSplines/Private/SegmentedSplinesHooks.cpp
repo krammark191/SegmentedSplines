@@ -12,13 +12,23 @@
 #include "Hologram/FGWallAttachmentHologram.h"
 #include "Hologram/HologramHelpers.h"
 #include "Buildables/FGBuildablePole.h"
+#include "Buildables/FGBuildableConveyorBelt.h"
+#include "Equipment/FGBuildGunBuild.h"
+#include "FGCharacterPlayer.h"
+#include "FGConstructDisqualifier.h"
+#include "FGFactoryConnectionComponent.h"
 
 #include "Components/SplineComponent.h"
 #include "CollisionQueryParams.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
 
 TSet< TWeakObjectPtr< AFGHologram > > FSegmentedSplinesHooks::sDisabledByUs;
+TMap< TWeakObjectPtr< AFGHologram >, FHitResult > FSegmentedSplinesHooks::sLastHit;
+TUniquePtr< FSegmentedSplinesHooks::FChainPlan > FSegmentedSplinesHooks::sChain;
+FTSTicker::FDelegateHandle FSegmentedSplinesHooks::sTicker;
+bool FSegmentedSplinesHooks::sDriverBusy = false;
 
 // The build gun's trace channel. FactoryGame.h declares TC_BuildGun but the SML header stubs never
 // define it, so it does not link; the value comes from Config/DefaultEngine.ini ("BuildGun").
@@ -32,17 +42,49 @@ void FSegmentedSplinesHooks::RegisterHooks()
 {
 	// SUBSCRIBE_UOBJECT_METHOD patches the vtable slot of the given native class (via its CDO).
 	// Blueprint subclasses (the actual per-tier belt holograms) share that native vtable, so one
-	// hook per C++ hologram class covers every vanilla recipe. These are *pre* hooks: we trim the
-	// spline, then let vanilla's CheckValidPlacement run on the trimmed data.
+	// hook per C++ hologram class covers every vanilla recipe.
 	//
 	// CheckValidPlacement is protected, which is why this class is declared a friend in
 	// Config/AccessTransformers.ini: taking &AFGConveyorBeltHologram::CheckValidPlacement is only
 	// legal from inside a friend.
 
+	// Belts: chain. Before vanilla validates we only bookkeep; after it validates we strike the
+	// "too long" verdict for a chainable hologram.
 	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, CheckValidPlacement,
 		[]( auto& scope, AFGConveyorBeltHologram* self )
 		{
 			OnBeltCheckValidPlacement( self );
+		} );
+	SUBSCRIBE_UOBJECT_METHOD_AFTER( AFGConveyorBeltHologram, CheckValidPlacement,
+		[]( AFGConveyorBeltHologram* self )
+		{
+			OnBeltAfterCheckValidPlacement( self );
+		} );
+
+	// Remember what the cursor hit when the belt's far end was placed. The build gun tries
+	// snapping first and only falls through to free placement if that fails, so both are hooked.
+	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, TrySnapToActor,
+		[]( auto& scope, AFGConveyorBeltHologram* self, const FHitResult& hitResult )
+		{
+			OnBeltPlacementHit( self, hitResult );
+		} );
+	SUBSCRIBE_UOBJECT_METHOD( AFGConveyorBeltHologram, SetHologramLocationAndRotation,
+		[]( auto& scope, AFGConveyorBeltHologram* self, const FHitResult& hitResult )
+		{
+			OnBeltPlacementHit( self, hitResult );
+		} );
+
+	// The moment the player builds. For a chainable belt this reshapes the hologram into piece 0
+	// before vanilla serialises and sends it, and starts the driver for the rest.
+	SUBSCRIBE_METHOD( UFGBuildGunStateBuild::InternalConstructHologram,
+		[]( auto& scope, UFGBuildGunStateBuild* self, FNetConstructionID clientNetConstructID )
+		{
+			OnInternalConstructHologram( self, clientNetConstructID );
+		} );
+	SUBSCRIBE_METHOD_AFTER( UFGBuildGunStateBuild::InternalConstructHologram,
+		[]( UFGBuildGunStateBuild* self, FNetConstructionID clientNetConstructID )
+		{
+			OnAfterInternalConstructHologram( self, clientNetConstructID );
 		} );
 
 	SUBSCRIBE_UOBJECT_METHOD( AFGRailroadTrackHologram, CheckValidPlacement,
@@ -64,21 +106,385 @@ void FSegmentedSplinesHooks::RegisterHooks()
 }
 
 // ---------------------------------------------------------------------------------------------
-// Per-class entry points
+// Belts: chain
 // ---------------------------------------------------------------------------------------------
+
+FSegmentedSplinesHooks::FEndSupports FSegmentedSplinesHooks::GetBeltSupports( AFGConveyorBeltHologram* belt, int32 endIndex )
+{
+	// Vanilla activates exactly one of the three per end depending on what the cursor hit
+	// (floor, wall, ceiling).
+	FEndSupports supports;
+	supports.Pole = belt->mChildPoleHologram[ endIndex ].Get();
+	supports.Mounts.Add( belt->mChildWallPoleHologram[ endIndex ].Get() );
+	supports.Mounts.Add( belt->mChildCeilingPoleHologram[ endIndex ].Get() );
+	return supports;
+}
+
+bool FSegmentedSplinesHooks::IsChainCandidate( AFGConveyorBeltHologram* belt )
+{
+	if( !belt || sDriverBusy || !belt->IsLocalHologram() )
+	{
+		return false;
+	}
+	const ESplineHologramBuildStep step = belt->GetCurrentBuildStep();
+	if( step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding && step != ESplineHologramBuildStep::SHBS_AdjustPole )
+	{
+		return false;
+	}
+	if( !belt->mSplineComponent || belt->mSplineData.Num() < 2 || belt->mMaxSplineLength <= 0.f )
+	{
+		return false;
+	}
+	const float length = belt->mSplineComponent->GetSplineLength();
+	if( length <= belt->mMaxSplineLength )
+	{
+		return false;
+	}
+	const int32 pieces = FMath::CeilToInt( length / ( belt->mMaxSplineLength - kSafetyMargin ) );
+	return pieces <= kMaxChainPieces;
+}
 
 void FSegmentedSplinesHooks::OnBeltCheckValidPlacement( AFGConveyorBeltHologram* self )
 {
-	if( !self ) return;
-	// Index 1 of each child array is the far end. Vanilla activates exactly one of the three
-	// depending on what the cursor hit (floor, wall, ceiling); after a trim only the ground pole
-	// can make sense, so the mounts are always disabled.
-	FEndSupports supports;
-	supports.Pole = self->mChildPoleHologram[ 1 ].Get();
-	supports.Mounts.Add( self->mChildWallPoleHologram[ 1 ].Get() );
-	supports.Mounts.Add( self->mChildCeilingPoleHologram[ 1 ].Get() );
-	TruncateIfTooLong( self, self->mMaxSplineLength, supports, TEXT( "belt" ) );
+	if( !self || sDriverBusy || !self->IsLocalHologram() )
+	{
+		return;
+	}
+	// A belt back within the limit after a chain preview gets vanilla's own support choice again.
+	if( self->GetCurrentBuildStep() == ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding
+		&& self->mSplineComponent && self->mSplineComponent->GetSplineLength() <= self->mMaxSplineLength )
+	{
+		RestoreSupports( GetBeltSupports( self, 1 ) );
+	}
 }
+
+void FSegmentedSplinesHooks::OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self )
+{
+	if( !IsChainCandidate( self ) )
+	{
+		return;
+	}
+	// Vanilla has just judged the full curve too long. Every piece we will send is under the limit,
+	// so that verdict does not apply; everything else it found (clearance, cost, snapping) stands.
+	const int32 removed = self->mConstructDisqualifiers.Remove( UFGCDConveyorTooLong::StaticClass() );
+	if( removed > 0 )
+	{
+		UE_LOG( LogSegmentedSplines, VeryVerbose, TEXT( "[belt] %.0f cm hologram over the %.0f limit, chainable: cleared TooLong" ),
+			self->mSplineComponent->GetSplineLength(), self->mMaxSplineLength );
+	}
+}
+
+void FSegmentedSplinesHooks::OnBeltPlacementHit( AFGConveyorBeltHologram* self, const FHitResult& hit )
+{
+	if( self && !sDriverBusy && self->IsLocalHologram() )
+	{
+		sLastHit.FindOrAdd( self ) = hit;
+	}
+}
+
+void FSegmentedSplinesHooks::OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id )
+{
+	if( sDriverBusy )
+	{
+		// The driver itself constructing a piece; let it through untouched.
+		return;
+	}
+	AFGConveyorBeltHologram* belt = Cast< AFGConveyorBeltHologram >( self ? self->GetHologram() : nullptr );
+	if( !IsChainCandidate( belt ) )
+	{
+		return;
+	}
+	if( sChain )
+	{
+		AbortChain( TEXT( "a new build started while a chain was still running" ) );
+	}
+	// Everything from here until the after-hook clears the flag happens with the placement hooks
+	// standing aside, so re-validating the reshaped hologram cannot undo what we set up.
+	sDriverBusy = true;
+	if( !PlanChain( belt, self, id ) )
+	{
+		sDriverBusy = false;
+	}
+}
+
+void FSegmentedSplinesHooks::OnAfterInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id )
+{
+	sDriverBusy = false;
+}
+
+bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState, FNetConstructionID id )
+{
+	USplineComponent* spline = belt->mSplineComponent;
+	const float maxLength = belt->mMaxSplineLength;
+	const float totalLength = spline->GetSplineLength();
+	const int32 numPieces = FMath::CeilToInt( totalLength / ( maxLength - kSafetyMargin ) );
+	const float pieceLength = totalLength / numPieces;
+
+	TUniquePtr< FChainPlan > plan = MakeUnique< FChainPlan >();
+	plan->BuildState = buildState;
+	plan->World = belt->GetWorld();
+	plan->Recipe = belt->GetRecipe();
+	plan->Frame = belt->GetActorTransform();
+	plan->BaseId = id;
+	if( const FHitResult* hit = sLastHit.Find( belt ) )
+	{
+		plan->EndHit = *hit;
+		plan->bHasEndHit = true;
+	}
+
+	// Cut the curve into equal pieces. The game's splitter works on a spline component, so the
+	// hologram's own component is reused for each remainder and put back on piece 0 at the end.
+	TArray< FSplinePointData > remaining = belt->mSplineData;
+	for( int32 i = 0; i < numPieces - 1; ++i )
+	{
+		belt->mSplineData = remaining;
+		belt->UpdateSplineComponent();
+		TArray< FSplinePointData > first;
+		TArray< FSplinePointData > rest;
+		FSplineUtils::SplitSplineAtDistance( spline, pieceLength, first, rest );
+		if( first.Num() < 2 || rest.Num() < 2 )
+		{
+			belt->mSplineData = remaining;
+			belt->UpdateSplineComponent();
+			UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] split %d of %d produced %d + %d points, building vanilla's way" ), i + 1, numPieces, first.Num(), rest.Num() );
+			return false;
+		}
+		plan->Pieces.Add( MoveTemp( first ) );
+		remaining = MoveTemp( rest );
+	}
+	plan->Pieces.Add( MoveTemp( remaining ) );
+
+	// Piece 0 keeps the player's start (its snap and start pole are already vanilla's) and gets a
+	// joint at its far end: no snap, no mount, a pole only if there is a floor under it.
+	belt->mSplineData = plan->Pieces[ 0 ];
+	belt->UpdateSplineComponent();
+	belt->mSnappedConnectionComponents[ 1 ] = nullptr;
+	belt->mSnappedWallPassthrough[ 1 ] = nullptr;
+	const FVector endWorld = plan->Frame.TransformPosition( belt->mSplineData.Last().Location );
+	SeatOrDisableEndPole( belt, maxLength - kSafetyMargin, GetBeltSupports( belt, 1 ), endWorld, 0.f, false, TEXT( "chain piece 1" ) );
+	ValidateForConstruction( belt );
+	if( !belt->CanConstruct() )
+	{
+		TArray< TSubclassOf< UFGConstructDisqualifier > > why;
+		belt->GetConstructDisqualifiers( why );
+		FString names;
+		for( auto& d : why ) names += ( d ? d->GetName() : TEXT( "null" ) ) + TEXT( " " );
+		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] piece 1 of %d is not constructible (%s); building it anyway so vanilla reports why" ), numPieces, *names );
+	}
+
+	plan->NextPiece = 1;
+	plan->bWaiting = true;
+	plan->WaitStart = plan->Frame.TransformPosition( plan->Pieces[ 0 ][ 0 ].Location );
+	plan->WaitEnd = plan->Frame.TransformPosition( plan->Pieces[ 0 ].Last().Location );
+	plan->SentAt = FPlatformTime::Seconds();
+	sChain = MoveTemp( plan );
+
+	if( !sTicker.IsValid() )
+	{
+		sTicker = FTSTicker::GetCoreTicker().AddTicker( FTickerDelegate::CreateStatic( &FSegmentedSplinesHooks::TickChain ) );
+	}
+
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] %.0f cm belt -> %d pieces of %.0f cm (limit %.0f); piece 1 goes with the player's build" ),
+		totalLength, numPieces, pieceLength, maxLength );
+	return true;
+}
+
+void FSegmentedSplinesHooks::ValidateForConstruction( AFGConveyorBeltHologram* belt )
+{
+	UFGInventoryComponent* inventory = nullptr;
+	if( AFGCharacterPlayer* player = Cast< AFGCharacterPlayer >( belt->GetConstructionInstigator() ) )
+	{
+		inventory = player->GetInventory();
+	}
+	belt->ValidatePlacementAndCost( inventory );
+}
+
+bool FSegmentedSplinesHooks::TickChain( float deltaTime )
+{
+	if( !sChain )
+	{
+		sTicker.Reset();
+		return false;
+	}
+	FChainPlan& plan = *sChain;
+	UWorld* world = plan.World.Get();
+	if( !world || !plan.BuildState.IsValid() )
+	{
+		AbortChain( TEXT( "world or build gun went away" ) );
+		return false;
+	}
+
+	if( plan.bWaiting )
+	{
+		// The server builds the piece and replicates the belt back. Find it by its ends.
+		for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
+		{
+			AFGBuildableConveyorBelt* candidate = *it;
+			UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
+			UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
+			if( !c0 || !c1 )
+			{
+				continue;
+			}
+			if( FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart ) <= kJointTolerance
+				&& FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd ) <= kJointTolerance )
+			{
+				plan.LastBelt = candidate;
+				plan.bWaiting = false;
+				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms" ),
+					plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0 );
+				break;
+			}
+		}
+		if( plan.bWaiting )
+		{
+			if( FPlatformTime::Seconds() - plan.SentAt > kPieceTimeout )
+			{
+				AbortChain( TEXT( "timed out waiting for the server to build a piece (rejected, or out of belts?)" ) );
+				return false;
+			}
+			return true;
+		}
+	}
+
+	if( plan.NextPiece >= plan.Pieces.Num() )
+	{
+		UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] done, %d pieces built" ), plan.Pieces.Num() );
+		sChain.Reset();
+		sTicker.Reset();
+		return false;
+	}
+
+	SendNextPiece();
+	return sChain.IsValid();
+}
+
+void FSegmentedSplinesHooks::SendNextPiece()
+{
+	FChainPlan& plan = *sChain;
+	UFGBuildGunStateBuild* buildState = plan.BuildState.Get();
+	AFGConveyorBeltHologram* holo = Cast< AFGConveyorBeltHologram >( buildState ? buildState->GetHologram() : nullptr );
+	if( !holo )
+	{
+		AbortChain( TEXT( "the build gun no longer holds a belt hologram" ) );
+		return;
+	}
+	if( holo->GetRecipe() != plan.Recipe )
+	{
+		AbortChain( TEXT( "the build gun switched recipe" ) );
+		return;
+	}
+	AFGBuildableConveyorBelt* previous = plan.LastBelt.Get();
+	if( !previous || !previous->GetConnection1() )
+	{
+		AbortChain( TEXT( "the previous piece vanished" ) );
+		return;
+	}
+
+	const int32 i = plan.NextPiece;
+	const bool bFinal = ( i == plan.Pieces.Num() - 1 );
+	const float maxLength = holo->mMaxSplineLength;
+
+	// From here the placement hooks stand aside: the hologram is ours until it is sent.
+	sDriverBusy = true;
+
+	// Start: snapped to the previous belt's output, so the two connect. Vanilla hides the start
+	// supports for a snapped start; this hologram never went through that step, so do it by hand.
+	holo->SetActorTransform( plan.Frame );
+	holo->mSnappedConnectionComponents[ 0 ] = previous->GetConnection1();
+	holo->mSnappedWallPassthrough[ 0 ] = nullptr;
+	{
+		FEndSupports startSupports = GetBeltSupports( holo, 0 );
+		if( startSupports.Pole && !startSupports.Pole->IsDisabled() ) DisableSupport( startSupports.Pole );
+		for( AFGHologram* mount : startSupports.Mounts )
+		{
+			if( mount && !mount->IsDisabled() ) DisableSupport( mount );
+		}
+	}
+	holo->mBuildStep = ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding;
+
+	if( bFinal && plan.bHasEndHit )
+	{
+		// The last piece ends where the player's cursor was. Let vanilla place that end from the
+		// same hit so it chooses the support (pole, wall or ceiling mount) or snaps to the machine
+		// exactly as it did for the original hologram; then put our piece's curve back under it.
+		holo->mSplineData = plan.Pieces[ i ];
+		holo->UpdateSplineComponent();
+		const bool snapped = holo->TrySnapToActor( plan.EndHit );
+		if( !snapped )
+		{
+			holo->SetHologramLocationAndRotation( plan.EndHit );
+		}
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece end placed by vanilla (%s)" ), snapped ? TEXT( "snapped" ) : TEXT( "free placement" ) );
+	}
+	else
+	{
+		holo->mSnappedConnectionComponents[ 1 ] = nullptr;
+		holo->mSnappedWallPassthrough[ 1 ] = nullptr;
+	}
+
+	holo->mSplineData = plan.Pieces[ i ];
+	holo->UpdateSplineComponent();
+
+	if( !bFinal || !plan.bHasEndHit )
+	{
+		const FVector endWorld = plan.Frame.TransformPosition( holo->mSplineData.Last().Location );
+		SeatOrDisableEndPole( holo, maxLength - kSafetyMargin, GetBeltSupports( holo, 1 ), endWorld, 0.f, false, TEXT( "chain joint" ) );
+	}
+
+	ValidateForConstruction( holo );
+	if( !holo->CanConstruct() )
+	{
+		TArray< TSubclassOf< UFGConstructDisqualifier > > why;
+		holo->GetConstructDisqualifiers( why );
+		FString names;
+		for( auto& d : why ) names += ( d ? d->GetName() : TEXT( "null" ) ) + TEXT( " " );
+		sDriverBusy = false;
+		AbortChain( *FString::Printf( TEXT( "piece %d of %d is not constructible: %s" ), i + 1, plan.Pieces.Num(), *names ) );
+		return;
+	}
+
+	FNetConstructionID pieceId = plan.BaseId;
+	pieceId.Client_ID = static_cast< uint16 >( plan.BaseId.Client_ID + kChainIdOffset + i );
+
+	if( bFinal )
+	{
+		plan.NextPiece = plan.Pieces.Num();
+		plan.bWaiting = false;
+	}
+	else
+	{
+		plan.NextPiece = i + 1;
+		plan.bWaiting = true;
+		plan.WaitStart = plan.Frame.TransformPosition( plan.Pieces[ i ][ 0 ].Location );
+		plan.WaitEnd = plan.Frame.TransformPosition( plan.Pieces[ i ].Last().Location );
+		plan.SentAt = FPlatformTime::Seconds();
+	}
+
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
+	// Vanilla serialises the hologram, sends it, shows the pending copy and spawns a fresh hologram.
+	// The after-hook clears sDriverBusy.
+	buildState->InternalConstructHologram( pieceId );
+	sDriverBusy = false;
+}
+
+void FSegmentedSplinesHooks::AbortChain( const TCHAR* reason )
+{
+	if( sChain )
+	{
+		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] stopped after %d of %d pieces: %s" ), sChain->NextPiece, sChain->Pieces.Num(), reason );
+		sChain.Reset();
+	}
+	if( sTicker.IsValid() )
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker( sTicker );
+		sTicker.Reset();
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tracks and pipes: cut at the limit
+// ---------------------------------------------------------------------------------------------
 
 void FSegmentedSplinesHooks::OnTrackCheckValidPlacement( AFGRailroadTrackHologram* self )
 {
@@ -95,10 +501,6 @@ void FSegmentedSplinesHooks::OnPipelineCheckValidPlacement( AFGPipelineHologram*
 	supports.Mounts.Add( self->mChildWallPoleHologram[ 1 ].Get() );
 	TruncateIfTooLong( self, self->mMaxSplineLength, supports, TEXT( "pipeline" ) );
 }
-
-// ---------------------------------------------------------------------------------------------
-// Core
-// ---------------------------------------------------------------------------------------------
 
 bool FSegmentedSplinesHooks::TruncateIfTooLong( AFGSplineHologram* hologram, float maxLength, const FEndSupports& supports, const TCHAR* debugName )
 {
@@ -122,10 +524,10 @@ bool FSegmentedSplinesHooks::TruncateIfTooLong( AFGSplineHologram* hologram, flo
 		return false;
 	}
 
-	// If the far end is snapped to a connection (a machine input, another belt...), the player is
-	// clearly aiming at that connection. Cutting the belt short would leave it floating next to
-	// the target, so keep vanilla's "too long" behaviour in that case. Vanilla disables the pole
-	// itself while snapped, so we must not touch it either.
+	// If the far end is snapped to a connection (a machine input, another pipe...), the player is
+	// clearly aiming at that connection. Cutting short would leave it floating next to the target,
+	// so keep vanilla's "too long" behaviour in that case. Vanilla disables the pole itself while
+	// snapped, so we must not touch it either.
 	if( hologram->IsConnectionSnapped( true ) )
 	{
 		return false;
@@ -177,7 +579,7 @@ bool FSegmentedSplinesHooks::TruncateIfTooLong( AFGSplineHologram* hologram, flo
 	float finalLength = hologram->mSplineComponent->GetSplineLength();
 	if( supports.Pole )
 	{
-		finalLength = SeatOrDisableEndPole( hologram, cutDistance, supports, oldEndWorld, oldEndYaw, debugName );
+		finalLength = SeatOrDisableEndPole( hologram, cutDistance, supports, oldEndWorld, oldEndYaw, true, debugName );
 	}
 
 	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] trimmed spline from %.0f cm to %.0f cm (limit %.0f)" ),
@@ -185,14 +587,18 @@ bool FSegmentedSplinesHooks::TruncateIfTooLong( AFGSplineHologram* hologram, flo
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// End supports
+// ---------------------------------------------------------------------------------------------
+
 float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram, float cutDistance, const FEndSupports& supports,
-	const FVector& oldEndWorld, float oldEndYaw, const TCHAR* debugName )
+	const FVector& oldEndWorld, float oldEndYaw, bool bPoleIsVanillaPlaced, const TCHAR* debugName )
 {
 	AFGPoleHologram* pole = supports.Pole;
 	USplineComponent* spline = hologram->mSplineComponent;
 	const FTransform hologramTransform = hologram->GetActorTransform();
 
-	// Wall / ceiling mounts belong to the cursor's surface, which the cut end is nowhere near.
+	// Wall / ceiling mounts belong to the cursor's surface, which this end is nowhere near.
 	for( AFGHologram* mount : supports.Mounts )
 	{
 		if( mount && !mount->IsDisabled() )
@@ -200,21 +606,25 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 			DisableSupport( mount );
 		}
 	}
+	if( !pole )
+	{
+		return spline->GetSplineLength();
+	}
 
 	FVector newEndWorld = hologramTransform.TransformPosition( hologram->mSplineData.Last().Location );
 
 	// Vertical gap between the spline end and the pole top as vanilla placed them. Normally ~0, but
-	// read it from the live hologram rather than assuming. Only meaningful while the pole is active;
-	// if vanilla had switched to a wall mount the ground pole is stale, so fall back to 0.
+	// read it from the live hologram rather than assuming. Only meaningful while the pole is active
+	// and was placed by vanilla for this end; otherwise its state is stale and 0 is the safe guess.
 	float topOffset = 0.f;
-	if( !pole->IsDisabled() )
+	if( bPoleIsVanillaPlaced && !pole->IsDisabled() )
 	{
 		topOffset = FMath::Clamp( oldEndWorld.Z - ( pole->GetActorLocation().Z + pole->GetPoleHeight() ), -50.f, 50.f );
 	}
 
 	const float maxPoleHeight = GetMaxPoleHeight( pole );
 
-	// Straight down from the cut end, as far as the tallest pole could reach. Same channel as the
+	// Straight down from the end, as far as the tallest pole could reach. Same channel as the
 	// build gun, so we see what the player could have aimed at. The hologram, its children and the
 	// player are not floors.
 	FCollisionQueryParams params( SCENE_QUERY_STAT( SegmentedSplinesFloor ), false );
@@ -243,7 +653,7 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 		{
 			DisableSupport( pole );
 		}
-		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] no floor within %.0f cm below the cut end, end left free (pole disabled)" ),
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] no floor within %.0f cm below the end, end left free (pole disabled)" ),
 			debugName, maxPoleHeight );
 		return spline->GetSplineLength();
 	}
@@ -260,12 +670,13 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 		{
 			DisableSupport( pole );
 		}
-		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] floor %.0f cm below the cut end but closest pole height is %.0f, end left free (pole disabled)" ),
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] floor %.0f cm below the end but closest pole height is %.0f, end left free (pole disabled)" ),
 			debugName, desiredHeight, actualHeight );
 		return spline->GetSplineLength();
 	}
 
-	// Seat the pole: on the floor, under the end, turned by however much the end direction changed.
+	// Seat the pole: on the floor, under the end, facing along the end of the curve. For a pole
+	// vanilla placed, keep its convention by turning it by however much the end direction changed.
 	if( sDisabledByUs.Contains( pole ) )
 	{
 		pole->SetDisabled( false );
@@ -275,12 +686,13 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 	FRotator poleRotation = pole->GetActorRotation();
 	if( !newEndDir.IsNearlyZero() )
 	{
-		poleRotation.Yaw += newEndDir.Rotation().Yaw - oldEndYaw;
+		const float newEndYaw = newEndDir.Rotation().Yaw;
+		poleRotation.Yaw = bPoleIsVanillaPlaced ? poleRotation.Yaw + ( newEndYaw - oldEndYaw ) : newEndYaw;
 	}
 	pole->SetActorLocationAndRotation( hit.ImpactPoint, poleRotation );
 
 	// Put the spline end on the pole top. Vanilla routes the belt to the pole's connection, which
-	// is what makes the two meet; a trimmed end has to be moved there by hand.
+	// is what makes the two meet; an end we placed has to be moved there by hand.
 	if( !FMath::IsNearlyZero( mismatch, 0.5f ) )
 	{
 		hologram->mSplineData.Last().Location += hologramTransform.InverseTransformVector( FVector( 0.f, 0.f, mismatch ) );
@@ -303,7 +715,7 @@ float FSegmentedSplinesHooks::SeatOrDisableEndPole( AFGSplineHologram* hologram,
 		}
 	}
 
-	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] pole seated on floor %.0f cm below the cut end (height %.0f, nudged end by %.1f cm)" ),
+	UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[%s] pole seated on floor %.0f cm below the end (height %.0f, nudged end by %.1f cm)" ),
 		debugName, desiredHeight, actualHeight, mismatch );
 	return spline->GetSplineLength();
 }

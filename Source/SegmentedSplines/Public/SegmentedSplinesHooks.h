@@ -2,6 +2,11 @@
 
 #include "CoreMinimal.h"
 #include "UObject/WeakObjectPtr.h"
+#include "Engine/HitResult.h"
+#include "Containers/Ticker.h"
+#include "Templates/SubclassOf.h"
+#include "FGBuildableSubsystem.h"
+#include "Components/SplineComponent.h"
 
 class AFGHologram;
 class AFGSplineHologram;
@@ -9,26 +14,31 @@ class AFGPoleHologram;
 class AFGConveyorBeltHologram;
 class AFGRailroadTrackHologram;
 class AFGPipelineHologram;
+class AFGBuildableConveyorBelt;
+class UFGBuildGunStateBuild;
+class UFGRecipe;
 
 /**
- * Phase 1 of Segmented Splines: "build what fits".
+ * Segmented Splines.
  *
- * Vanilla lets you drag a spline hologram past its length limit, keeps routing the curve
- * toward your cursor, then refuses to build with "too long". We hook each spline hologram's
- * CheckValidPlacement (which the build gun runs every update, right after the spline has been
- * routed) and, if the routed spline is over the limit, cut it at the limit while keeping the
- * exact curve that was routed toward the far destination. Vanilla validation then passes and
- * the construction message the client sends to the server only ever contains a legal segment,
- * so an unmodded server accepts it.
+ * Vanilla lets you drag a spline hologram past its length limit, keeps routing the curve toward
+ * your cursor, then refuses to build with "too long". Everything here runs on the local player's
+ * hologram only and never sends the server anything a vanilla client could not have sent.
  *
- * The cut end then needs a support. Vanilla placed the end pole under the cursor, which is
- * usually nowhere near the cut. We line-trace straight down from the cut end: if there is a
- * floor within the pole's reach, the pole is seated on it at the right height and the spline
- * end is nudged onto the pole top; otherwise the pole is disabled, which is the same switch
- * vanilla flips when a belt end snaps to a machine, so the end is simply left free (a belt
- * whose pole was dismantled is in the same state).
+ * Belts (phase 2, "chain"): the full hologram stays as vanilla routed it and its "too long"
+ * disqualifier is removed. When the player builds, the build gun's construct call is intercepted:
+ * the curve is cut into N equal pieces, each under the limit, and they are sent one at a time.
+ * Each piece after the first snaps its start to the previous belt's output, which means waiting
+ * for that belt to replicate back from the server before the next piece can be sent. The last
+ * piece ends where the cursor was, with vanilla's own end support (pole, wall or ceiling mount,
+ * or a snapped machine input); the joints in between get a ground pole if there is a floor in
+ * reach below them and are left free otherwise.
  *
- * Everything here runs on the local player's hologram only. Nothing is replicated by this mod.
+ * Pipes (phase 1, "build what fits"): the spline is cut at the limit while keeping the routed
+ * curve, and the end pole is seated on the floor below the cut or disabled if there is none.
+ *
+ * Disabling a support uses the same switch vanilla flips when a belt end snaps to a machine
+ * (mIsDisabled, which is in the construction message), so the server sees the same thing.
  *
  * The class name is referenced from Config/AccessTransformers.ini (Friend=...), which is what
  * lets it touch protected/private hologram members. Keep the two in sync if you rename it.
@@ -59,24 +69,67 @@ private:
 	/** Floors steeper than this (normal.Z below the value) are not accepted. cos(40 deg). */
 	static constexpr float kMinFloorNormalZ = 0.766f;
 
-	/** The supports vanilla may have placed under the far end of a spline. */
+	/** Longest chain we are willing to build in one go. */
+	static constexpr int32 kMaxChainPieces = 32;
+
+	/** A replicated belt whose ends are within this distance of a piece's ends is that piece. [cm] */
+	static constexpr float kJointTolerance = 25.0f;
+
+	/** Give up on a piece if the server has not sent its belt back within this time. [s] */
+	static constexpr double kPieceTimeout = 10.0;
+
+	/**
+	 * Construction IDs for pieces after the first are the first piece's ID with Client_ID moved
+	 * this far up, so they cannot collide with the IDs the build gun keeps handing out.
+	 */
+	static constexpr uint16 kChainIdOffset = 10000;
+
+	/** The supports vanilla may have placed under one end of a spline. */
 	struct FEndSupports
 	{
-		/** The height-adjustable ground pole for the far end (belts, pipes). May be null (rails). */
+		/** The height-adjustable ground pole (belts, pipes). May be null (rails). */
 		AFGPoleHologram* Pole = nullptr;
-		/** Wall / ceiling mounts for the far end. Disabled whenever we trim. */
+		/** Wall / ceiling mounts. Disabled whenever we take over an end. */
 		TArray< AFGHologram*, TInlineAllocator< 2 > > Mounts;
 	};
+
+	/** One belt chain in flight. Only one can exist: the build gun only builds one thing at a time. */
+	struct FChainPlan
+	{
+		TWeakObjectPtr< UFGBuildGunStateBuild > BuildState;
+		TWeakObjectPtr< UWorld > World;
+		TSubclassOf< UFGRecipe > Recipe;
+		/** Transform of the hologram the plan was made from; every piece is in this space. */
+		FTransform Frame;
+		TArray< TArray< FSplinePointData > > Pieces;
+		/** What the cursor hit when the player placed the far end; recreates vanilla's end support. */
+		FHitResult EndHit;
+		bool bHasEndHit = false;
+		FNetConstructionID BaseId;
+		/** Index of the next piece to send. */
+		int32 NextPiece = 0;
+		/** Waiting for the belt of piece NextPiece-1 to replicate. */
+		bool bWaiting = false;
+		FVector WaitStart = FVector::ZeroVector;
+		FVector WaitEnd = FVector::ZeroVector;
+		double SentAt = 0.0;
+		TWeakObjectPtr< AFGBuildableConveyorBelt > LastBelt;
+	};
+
+	// --- phase 1: cut at the limit (pipes; also used for the belt pieces' joints) -------------
 
 	/** Shared implementation. Returns true if the hologram was truncated. */
 	static bool TruncateIfTooLong( AFGSplineHologram* hologram, float maxLength, const FEndSupports& supports, const TCHAR* debugName );
 
 	/**
-	 * Seat the end pole on the floor below the cut end, or disable it if there is none in reach.
+	 * Seat the end pole on the floor below the spline end, or disable it if there is none in reach.
 	 * May nudge the last spline point vertically and re-trim; returns the final spline length.
+	 * @param oldEndWorld / oldEndYaw  where the end was before we moved it, if the pole was placed
+	 *        there by vanilla; its top offset and facing are carried over. Pass bPoleIsVanillaPlaced
+	 *        false for a fresh hologram, where the pole's current state means nothing.
 	 */
 	static float SeatOrDisableEndPole( AFGSplineHologram* hologram, float cutDistance, const FEndSupports& supports,
-		const FVector& oldEndWorld, float oldEndYaw, const TCHAR* debugName );
+		const FVector& oldEndWorld, float oldEndYaw, bool bPoleIsVanillaPlaced, const TCHAR* debugName );
 
 	/** Disable a support hologram and remember that it was us, not vanilla, who did it. */
 	static void DisableSupport( AFGHologram* support );
@@ -87,10 +140,35 @@ private:
 	/** Tallest height the pole's buildable class can be built at. */
 	static float GetMaxPoleHeight( const AFGPoleHologram* pole );
 
+	static FEndSupports GetBeltSupports( AFGConveyorBeltHologram* belt, int32 endIndex );
+
+	// --- phase 2: chain (belts) ---------------------------------------------------------------
+
+	/** True while the chain driver is configuring or constructing a piece; the placement hooks stand aside. */
+	static bool sDriverBusy;
+
+	static bool IsChainCandidate( AFGConveyorBeltHologram* belt );
 	static void OnBeltCheckValidPlacement( AFGConveyorBeltHologram* self );
+	static void OnBeltAfterCheckValidPlacement( AFGConveyorBeltHologram* self );
+	static void OnBeltPlacementHit( AFGConveyorBeltHologram* self, const FHitResult& hit );
+	static void OnInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id );
+	static void OnAfterInternalConstructHologram( UFGBuildGunStateBuild* self, FNetConstructionID id );
+
+	/** Cut the belt's full curve into equal pieces under the limit. Leaves the hologram on piece 0. */
+	static bool PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState, FNetConstructionID id );
+	/** Configure the build gun's current hologram as the next piece and construct it. */
+	static void SendNextPiece();
+	static bool TickChain( float deltaTime );
+	static void AbortChain( const TCHAR* reason );
+	static void ValidateForConstruction( AFGConveyorBeltHologram* belt );
+
 	static void OnTrackCheckValidPlacement( AFGRailroadTrackHologram* self );
 	static void OnPipelineCheckValidPlacement( AFGPipelineHologram* self );
 
 	/** Supports we switched off. Vanilla may legitimately disable the same holograms (snapping), so we only ever restore our own. */
 	static TSet< TWeakObjectPtr< AFGHologram > > sDisabledByUs;
+	/** Last cursor hit each belt hologram was placed with; the chain's final piece is placed with it again. */
+	static TMap< TWeakObjectPtr< AFGHologram >, FHitResult > sLastHit;
+	static TUniquePtr< FChainPlan > sChain;
+	static FTSTicker::FDelegateHandle sTicker;
 };

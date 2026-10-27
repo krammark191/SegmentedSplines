@@ -15,7 +15,11 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   Command-line equivalent of Alpakit Dev (run from the starter root with `UE_WINE_MSVC` exported):
   `RunUAT.sh -ScriptsForProject=<uproject> PackagePlugin -project=<uproject> -clientconfig=Shipping -serverconfig=Shipping -utf8output -DLCName=SegmentedSplines -build -platform=Win64 -nocompileeditor -installed -CopyToGameDirectory_Windows=<game>`
   (~10 min). Satisfactory Mod Manager 3.1.0 is installed and knows the Steam install.
-  Still unverified: every in-game behaviour in the test plan. Nothing has run in the game yet.
+- **In-game on a vanilla server (2026-10-26):** phase 1 trimming builds; a trimmed belt with its
+  pole disabled (free end in the air) builds; wall-support to wall-support spans work. Seen once:
+  aiming the far end at a bare pillar made vanilla's wall mount and our seated floor pole both
+  show up and the hologram went red (cause not diagnosed; the chain's final piece now hands that
+  end back to vanilla, which sidesteps it). Phase 2 chain is written but has not run in-game yet.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -38,8 +42,8 @@ Phases, in order:
 1. **Build what fits** (this draft). Drag past the limit; instead of red "too long", the hologram
    is cut at the limit *along the curve routed toward the cursor*, so the curve you aimed for is
    kept. Build, then continue from the end.
-2. **Chain**: drag the full distance, build once, mod splits into N equal legal pieces and sends
-   them one after another.
+2. **Chain** (first version in, belts only, 2026-10-26): drag the full distance, build once, mod
+   splits into N equal legal pieces and sends them one after another.
 3. **Bonus**: optionally auto-place a chosen blueprint at each joint (mainly for rail junctions).
 
 ## The one rule that makes client-only work
@@ -125,24 +129,49 @@ spline in PostHologramPlacement", which is why PostHologramPlacement is the othe
 2. Aim a long belt at a machine input → vanilla red "too long" (snap case excluded by design).
 3. **Real proof**: local Linux dedicated server (Steam app 1690800) with **no SML**, join from the
    modded client, repeat 1. If the server shows the belt, client-only is proven.
-4. `LogSegmentedSplines` category; set Verbose in Engine.ini for per-cut lines.
+4. `LogSegmentedSplines` category; set Verbose in Engine.ini for per-cut lines (already set in the
+   Proton prefix's `Saved/Config/Windows/Engine.ini` on the Linux PC). Chain steps log at Log level.
+5. Chain: Mk1 belt dragged 3-4x the limit across a gap; expect N pieces built one after another,
+   joints with a pole where there is floor and free otherwise, the far end as vanilla would place it.
 
-## Phase 2 design sketch (chaining)
+## Phase 2 (chaining) as implemented for belts
 
-- Let the local hologram show the full curve (suppress the cut while a "chain mode" toggle is on,
-  but still mark it valid only if each prospective piece would be valid).
-- On construct: split the full spline with `SplitSplineAtDistance` repeatedly into
-  `ceil(L / limit)` equal arc-length pieces, each < limit.
-- Send piece 1 through the normal build path. Wait for the server's constructed buildable to
-  replicate (`Client_OnBuildableConstructed` on the build state, or poll for the new actor), snap
-  piece 2's start to its end connection (`UFGFactoryConnectionComponent` for belts,
-  `UFGRailroadTrackConnectionComponent` for rails, `UFGPipeConnectionComponentBase` for pipes),
-  send, repeat. A few hundred ms per piece on a remote server.
-- Must handle mid-chain rejection (clearance, running out of belts: cost is checked per piece)
-  by stopping cleanly and leaving the partial run.
-- `AFGHologram::SetupPendingConstructionHologram` exists ("client-sided representation of a
-  hologram that the server will construct soon") but pieces cannot snap to a pending actor, so
-  waiting is required.
+In-game result that motivated it: on a vanilla server, a trimmed belt whose cut end hung in the
+air built fine with the pole disabled (free end), so sending one legal piece after another works.
+
+- Belts no longer trim. `IsChainCandidate`: local, step PlacePoleOrSnapEnding or AdjustPole,
+  length > `mMaxSplineLength`, ceil(L / (limit - margin)) <= `kMaxChainPieces` (32).
+- After-hook on `CheckValidPlacement` removes `UFGCDConveyorTooLong` from `mConstructDisqualifiers`
+  for a chain candidate, so the full hologram shows valid (everything else vanilla found stands).
+- Pre-hooks on `TrySnapToActor` / `SetHologramLocationAndRotation` record the last cursor hit per
+  belt hologram (`sLastHit`).
+- Pre-hook on `UFGBuildGunStateBuild::InternalConstructHologram` (the client call that serialises
+  the hologram and sends `Server_ConstructHologram`): for a chain candidate, `PlanChain` cuts the
+  curve into N equal pieces with `SplitSplineAtDistance` (reusing the hologram's spline component
+  for each remainder), reshapes the hologram into piece 0 (end snap cleared, joint handled by
+  `SeatOrDisableEndPole`), re-validates it and lets vanilla send it. `sDriverBusy` makes the
+  placement hooks stand aside while the driver touches a hologram; an after-hook clears it.
+- `TickChain` (core ticker) waits for the previous piece's belt to replicate: it scans
+  `AFGBuildableConveyorBelt` actors for one whose connection0/1 are within 25 cm of the piece's
+  ends, 10 s timeout. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
+  build (`GetHologram()`), puts it in the plan's frame, snaps its start to the previous belt's
+  `GetConnection1()`, disables its start supports by hand, sets the build step, and:
+  - intermediate piece: clears the end snap, `SeatOrDisableEndPole` at the joint;
+  - final piece: `TrySnapToActor(EndHit)` then `SetHologramLocationAndRotation(EndHit)` so vanilla
+    recreates the end the player aimed at (pole, wall/ceiling mount, or snapped machine), then the
+    piece's curve is put back under it;
+  then `ValidatePlacementAndCost`, and `InternalConstructHologram` with the first piece's
+  `FNetConstructionID` whose `Client_ID` is moved up by 10000 + i (collision avoidance only).
+- Abort (log Warning, leave the partial run) on: timeout, hologram gone or recipe changed, previous
+  belt gone, piece not constructible (disqualifier names are logged).
+- Not yet: chaining for pipes and tracks (they still trim, phase 1), a preview of the joint
+  supports along the full hologram (the user asked for it; the full curve itself is shown by
+  vanilla), handling of vanilla's own construction failure RPC (timeout covers it).
+
+Everything above about vanilla's internals (what InternalConstructHologram checks, whether
+SetHologramLocationAndRotation on a fresh hologram in PlacePoleOrSnapEnding needs more start state
+than the snapped connection, FNetConstructionID semantics) is inferred from headers. First in-game
+run of the chain is the test; `LogSegmentedSplines` Log-level lines narrate every step.
 
 ## Phase 3 note (blueprint at joints)
 

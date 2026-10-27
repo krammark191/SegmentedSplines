@@ -303,11 +303,14 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 		remaining = MoveTemp( rest );
 	}
 	plan->Pieces.Add( MoveTemp( remaining ) );
+	for( TArray< FSplinePointData >& piece : plan->Pieces )
+	{
+		ToWorld( plan->Frame, piece );
+	}
 
 	// Piece 0 keeps the player's start (its snap and start pole are already vanilla's) and gets a
 	// joint at its far end: no snap, no mount, a pole only if there is a floor under it.
-	belt->mSplineData = plan->Pieces[ 0 ];
-	belt->UpdateSplineComponent();
+	ApplyPiece( belt, plan->Pieces[ 0 ] );
 	belt->mSnappedConnectionComponents[ 1 ] = nullptr;
 	belt->mSnappedWallPassthrough[ 1 ] = nullptr;
 	const FVector endWorld = plan->Frame.TransformPosition( belt->mSplineData.Last().Location );
@@ -324,9 +327,10 @@ bool FSegmentedSplinesHooks::PlanChain( AFGConveyorBeltHologram* belt, UFGBuildG
 
 	plan->NextPiece = 1;
 	plan->bWaiting = true;
-	plan->WaitStart = plan->Frame.TransformPosition( plan->Pieces[ 0 ][ 0 ].Location );
-	plan->WaitEnd = plan->Frame.TransformPosition( plan->Pieces[ 0 ].Last().Location );
+	plan->WaitStart = plan->Pieces[ 0 ][ 0 ].Location;
+	plan->WaitEnd = plan->Pieces[ 0 ].Last().Location;
 	plan->SentAt = FPlatformTime::Seconds();
+	SnapshotBelts( *plan, belt->GetWorld() );
 	sChain = MoveTemp( plan );
 
 	if( !sTicker.IsValid() )
@@ -347,6 +351,39 @@ void FSegmentedSplinesHooks::ValidateForConstruction( AFGConveyorBeltHologram* b
 		inventory = player->GetInventory();
 	}
 	belt->ValidatePlacementAndCost( inventory );
+}
+
+void FSegmentedSplinesHooks::ToWorld( const FTransform& frame, TArray< FSplinePointData >& points )
+{
+	for( FSplinePointData& point : points )
+	{
+		point.Location = frame.TransformPosition( point.Location );
+		point.ArriveTangent = frame.TransformVector( point.ArriveTangent );
+		point.LeaveTangent = frame.TransformVector( point.LeaveTangent );
+	}
+}
+
+void FSegmentedSplinesHooks::ApplyPiece( AFGConveyorBeltHologram* hologram, const TArray< FSplinePointData >& worldPiece )
+{
+	const FTransform frame = hologram->GetActorTransform();
+	hologram->mSplineData = worldPiece;
+	for( FSplinePointData& point : hologram->mSplineData )
+	{
+		point.Location = frame.InverseTransformPosition( point.Location );
+		point.ArriveTangent = frame.InverseTransformVector( point.ArriveTangent );
+		point.LeaveTangent = frame.InverseTransformVector( point.LeaveTangent );
+	}
+	hologram->UpdateSplineComponent();
+}
+
+void FSegmentedSplinesHooks::SnapshotBelts( FChainPlan& plan, UWorld* world )
+{
+	plan.KnownBelts.Reset();
+	if( !world ) return;
+	for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
+	{
+		plan.KnownBelts.Add( *it );
+	}
 }
 
 bool FSegmentedSplinesHooks::TickChain( float deltaTime )
@@ -371,31 +408,38 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 		for( TActorIterator< AFGBuildableConveyorBelt > it( world ); it; ++it )
 		{
 			AFGBuildableConveyorBelt* candidate = *it;
-			bool match = false;
-			const TCHAR* how = TEXT( "" );
+			// Client IDs restart every launch, so a belt from an earlier session can carry the same
+			// ID; only a belt that did not exist when the piece was sent can be the piece.
+			if( plan.KnownBelts.Contains( candidate ) )
+			{
+				continue;
+			}
+			UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
+			UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
+			if( !c0 || !c1 )
+			{
+				continue;
+			}
+			const float startDist = FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart );
+			const float endDist = FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd );
+			bool idMatch = false;
 			if( plan.bHasPendingId )
 			{
 				const FNetConstructionID cid = candidate->GetNetConstructionID();
-				match = cid.NetPlayerID == plan.PendingId.NetPlayerID && cid.Client_ID == plan.PendingId.Client_ID;
-				how = TEXT( "construction id" );
+				idMatch = cid.NetPlayerID == plan.PendingId.NetPlayerID && cid.Client_ID == plan.PendingId.Client_ID;
 			}
-			if( !match )
+			// The far end is where the next piece attaches, so it has to be where we expect it. The
+			// start may legitimately differ (vanilla can weld a new belt into the one it starts from).
+			if( endDist > 4.f * kJointTolerance )
 			{
-				UFGFactoryConnectionComponent* c0 = candidate->GetConnection0();
-				UFGFactoryConnectionComponent* c1 = candidate->GetConnection1();
-				match = c0 && c1
-					&& FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart ) <= kJointTolerance
-					&& FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd ) <= kJointTolerance;
-				how = TEXT( "end positions" );
+				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new belt %s ignored: end %.0f cm from the expected joint (id match %d)" ), *candidate->GetName(), endDist, idMatch ? 1 : 0 );
+				continue;
 			}
-			if( match )
-			{
-				plan.LastBelt = candidate;
-				plan.bWaiting = false;
-				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms (matched by %s: %s)" ),
-					plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, how, *candidate->GetName() );
-				break;
-			}
+			plan.LastBelt = candidate;
+			plan.bWaiting = false;
+			UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms: %s (id match %d, start %.0f cm and end %.0f cm from expected)" ),
+				plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, *candidate->GetName(), idMatch ? 1 : 0, startDist, endDist );
+			break;
 		}
 		if( plan.bWaiting )
 		{
@@ -464,8 +508,23 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	const bool bFinal = ( i == plan.Pieces.Num() - 1 );
 	const float maxLength = holo->mMaxSplineLength;
 
+	// The built belt's output is where this piece really starts. Move the piece's first point onto
+	// it (the server may have adjusted the end by a few cm); anything larger means it is not our belt.
+	{
+		const FVector connector = previous->GetConnection1()->GetConnectorLocation();
+		const FVector delta = connector - plan.Pieces[ i ][ 0 ].Location;
+		if( delta.Size() > 4.f * kJointTolerance )
+		{
+			AbortChain( *FString::Printf( TEXT( "previous belt's output is %.0f cm from where piece %d starts" ), delta.Size(), i + 1 ) );
+			return;
+		}
+		plan.Pieces[ i ][ 0 ].Location = connector;
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] piece %d start moved %.1f cm onto the previous belt's output" ), i + 1, delta.Size() );
+	}
+
 	// From here the placement hooks stand aside: the hologram is ours until it is sent.
 	sDriverBusy = true;
+	plan.bHologramIsOurs = true;
 
 	// Start: snapped to the previous belt's output, so the two connect. Vanilla hides the start
 	// supports for a snapped start; this hologram never went through that step, so do it by hand.
@@ -487,14 +546,14 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		// The last piece ends where the player's cursor was. Let vanilla place that end from the
 		// same hit so it chooses the support (pole, wall or ceiling mount) or snaps to the machine
 		// exactly as it did for the original hologram; then put our piece's curve back under it.
-		holo->mSplineData = plan.Pieces[ i ];
-		holo->UpdateSplineComponent();
+		ApplyPiece( holo, plan.Pieces[ i ] );
 		const bool snapped = holo->TrySnapToActor( plan.EndHit );
 		if( !snapped )
 		{
 			holo->SetHologramLocationAndRotation( plan.EndHit );
 		}
-		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece end placed by vanilla (%s)" ), snapped ? TEXT( "snapped" ) : TEXT( "free placement" ) );
+		UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece end placed by vanilla (%s); hologram now at %s" ),
+			snapped ? TEXT( "snapped" ) : TEXT( "free placement" ), *holo->GetActorLocation().ToString() );
 	}
 	else
 	{
@@ -502,12 +561,13 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		holo->mSnappedWallPassthrough[ 1 ] = nullptr;
 	}
 
-	holo->mSplineData = plan.Pieces[ i ];
-	holo->UpdateSplineComponent();
+	// Vanilla may have moved the hologram while placing the end; the piece is in world space, so
+	// it lands in the same place regardless.
+	ApplyPiece( holo, plan.Pieces[ i ] );
 
 	if( !bFinal || !plan.bHasEndHit )
 	{
-		const FVector endWorld = plan.Frame.TransformPosition( holo->mSplineData.Last().Location );
+		const FVector endWorld = plan.Pieces[ i ].Last().Location;
 		SeatOrDisableEndPole( holo, maxLength - kSafetyMargin, GetBeltSupports( holo, 1 ), endWorld, 0.f, false, TEXT( "chain joint" ) );
 	}
 
@@ -538,14 +598,16 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		plan.NextPiece = i + 1;
 		plan.bWaiting = true;
 		plan.bHasPendingId = false;
-		plan.WaitStart = plan.Frame.TransformPosition( plan.Pieces[ i ][ 0 ].Location );
-		plan.WaitEnd = plan.Frame.TransformPosition( plan.Pieces[ i ].Last().Location );
+		plan.WaitStart = plan.Pieces[ i ][ 0 ].Location;
+		plan.WaitEnd = plan.Pieces[ i ].Last().Location;
 		plan.SentAt = FPlatformTime::Seconds();
 	}
+	SnapshotBelts( plan, buildState->GetWorld() );
 
 	UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] sending piece %d of %d" ), i + 1, plan.Pieces.Num() );
 	buildState->PrimaryFire();
 	sDriverBusy = false;
+	plan.bHologramIsOurs = false;
 
 	// A send replaces the build gun's hologram with a fresh one. If it is still ours, the build gun
 	// did not accept the click as a final step and nothing went out.
@@ -560,6 +622,14 @@ void FSegmentedSplinesHooks::AbortChain( const TCHAR* reason )
 	if( sChain )
 	{
 		UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] stopped after %d of %d pieces: %s" ), sChain->NextPiece, sChain->Pieces.Num(), reason );
+		// Do not leave the player holding a hologram we half-configured.
+		if( sChain->bHologramIsOurs )
+		{
+			if( UFGBuildGunStateBuild* buildState = sChain->BuildState.Get() )
+			{
+				buildState->ResetHologram();
+			}
+		}
 		sChain.Reset();
 	}
 	if( sTicker.IsValid() )

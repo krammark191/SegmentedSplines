@@ -95,8 +95,9 @@ private:
 		TWeakObjectPtr< UFGBuildGunStateBuild > BuildState;
 		TWeakObjectPtr< UWorld > World;
 		TSubclassOf< UFGRecipe > Recipe;
-		/** Transform of the hologram the plan was made from; every piece is in this space. */
+		/** Transform of the hologram the plan was made from; fresh holograms are moved here. */
 		FTransform Frame;
+		/** Pieces in world space; applied to whatever transform the hologram has at the time. */
 		TArray< TArray< FSplinePointData > > Pieces;
 		/** What the cursor hit when the player placed the far end; recreates vanilla's end support. */
 		FHitResult EndHit;
@@ -106,6 +107,10 @@ private:
 		/** Construction ID the client sent for the piece being waited on; the built belt carries it (replicated). */
 		FNetConstructionID PendingId;
 		bool bHasPendingId = false;
+		/** Belts that already existed when the piece was sent; the built one is a belt not in here. */
+		TSet< TWeakObjectPtr< AFGBuildableConveyorBelt > > KnownBelts;
+		/** Whether the build gun's current hologram was configured by the driver (reset it on abort). */
+		bool bHologramIsOurs = false;
 		/** Waiting for the belt of piece NextPiece-1 to replicate. */
 		bool bWaiting = false;
 		FVector WaitStart = FVector::ZeroVector;
@@ -161,6 +166,10 @@ private:
 	static UFGBuildGunStateBuild* FindBuildState( AFGHologram* hologram );
 	/** Cut the belt's full curve into equal pieces under the limit. Leaves the hologram on piece 0. */
 	static bool PlanChain( AFGConveyorBeltHologram* belt, UFGBuildGunStateBuild* buildState );
+	/** Put a world-space piece on a hologram, in the hologram's current transform. */
+	static void ApplyPiece( AFGConveyorBeltHologram* hologram, const TArray< FSplinePointData >& worldPiece );
+	static void ToWorld( const FTransform& frame, TArray< FSplinePointData >& points );
+	static void SnapshotBelts( FChainPlan& plan, UWorld* world );
 	/** Configure the build gun's current hologram as the next piece and have the build gun build it. */
 	static void SendNextPiece();
 	static bool TickChain( float deltaTime );

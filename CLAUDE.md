@@ -164,8 +164,17 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   NetPlayerID/Client_ID the client sent (captured in the serializer hook: the client serialises
   twice per build, an empty-ID pass for its pending copy, then the real ID), falling back to
   connection0/1 within 25 cm of the piece's ends; 10 s timeout, which then lists nearby belts
-  with their IDs and end distances. Third in-game run (2026-10-26): trigger and piece 1 worked,
-  the end-position match never found the built belt, hence the ID match. Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
+  with their IDs and end distances. Only belts that did not exist when the piece was sent
+  qualify (`KnownBelts` snapshot): client IDs restart every launch, so a belt from an earlier
+  session carries the same NetPlayerID/Client_ID (fourth run matched the previous session's
+  piece after 24 ms and snapped piece 2 onto it: "hologram jumped back, invalid shape"). The
+  far end must be within 100 cm of the expected joint; the start may differ (vanilla can weld a
+  new belt into the one it starts from). The built belt's output then becomes piece i's first
+  point. Pieces are stored in world space and applied in the hologram's current transform
+  (`ApplyPiece`), so vanilla moving the hologram during final-end placement cannot skew them.
+  On abort, a hologram the driver configured is discarded with `ResetHologram()` (protected;
+  `UFGBuildGunStateBuild` is in the Friend list for it). Third run: trigger and piece 1 worked,
+  the end-position match never found the built belt (reason still unknown, logged now). Then `SendNextPiece` takes the fresh hologram vanilla spawned after the last
   build (`GetHologram()`), puts it in the plan's frame, snaps its start to the previous belt's
   `GetConnection1()`, disables its start supports by hand, sets the build step, and:
   - intermediate piece: clears the end snap, `SeatOrDisableEndPole` at the joint;

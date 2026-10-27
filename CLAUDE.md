@@ -69,6 +69,7 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   blueprint red "too long" as it always did). A later 77 m / 70 m bridge pair in the same session
   built fine untouched. The crash folder from the end of that session is the crash reporter
   firing on a normal quit (`RequestExit` from the exit command, clean `LogExit` shutdown).
+  User confirmed after the fix (2026-10-27): "It works as intended now."
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

@@ -8,9 +8,14 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
 - **First build passed (2026-10-26, Linux PC).** `FactoryEditor Linux Development` against engine
   5.6.1-css-83 compiled and linked `libUnrealEditor-SegmentedSplines.so` with no errors or
   warnings on the first pass; the `AccessTransformers.ini` Friend entries took effect. Debug
-  symbols show all three hook lambdas and `TruncateIfTooLong` present. Still unverified: the
-  Win64 Shipping package that the Proton game actually runs (Alpakit, README step 8) and every
-  in-game behaviour in the test plan.
+  symbols show all three hook lambdas and `TruncateIfTooLong` present.
+- **Win64 Shipping package passed (2026-10-26).** MSVC 14.38 under wine compiled and linked
+  `FactoryGameSteam-SegmentedSplines-Win64-Shipping.dll` with no warnings; the package was
+  copied into the Proton game's `FactoryGame/Mods/SegmentedSplines/` next to SML 3.12.0.
+  Command-line equivalent of Alpakit Dev (run from the starter root with `UE_WINE_MSVC` exported):
+  `RunUAT.sh -ScriptsForProject=<uproject> PackagePlugin -project=<uproject> -clientconfig=Shipping -serverconfig=Shipping -utf8output -DLCName=SegmentedSplines -build -platform=Win64 -nocompileeditor -installed -CopyToGameDirectory_Windows=<game>`
+  (~10 min). Satisfactory Mod Manager 3.1.0 is installed and knows the Steam install.
+  Still unverified: every in-game behaviour in the test plan. Nothing has run in the game yet.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

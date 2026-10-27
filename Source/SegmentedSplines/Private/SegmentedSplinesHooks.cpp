@@ -420,25 +420,33 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 			{
 				continue;
 			}
-			const float startDist = FVector::Dist( c0->GetConnectorLocation(), plan.WaitStart );
-			const float endDist = FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd );
+			// A belt stores its spline in flow direction (connection0 = input, connection1 = output).
+			// When the player drags against the flow, the server reverses the points, so the joint can
+			// be at either connector: take whichever sits at the expected far end.
+			const float d1e = FVector::Dist( c1->GetConnectorLocation(), plan.WaitEnd );
+			const float d0e = FVector::Dist( c0->GetConnectorLocation(), plan.WaitEnd );
 			bool idMatch = false;
 			if( plan.bHasPendingId )
 			{
 				const FNetConstructionID cid = candidate->GetNetConstructionID();
 				idMatch = cid.NetPlayerID == plan.PendingId.NetPlayerID && cid.Client_ID == plan.PendingId.Client_ID;
 			}
-			// The far end is where the next piece attaches, so it has to be where we expect it. The
-			// start may legitimately differ (vanilla can weld a new belt into the one it starts from).
-			if( endDist > 4.f * kJointTolerance )
+			UFGFactoryConnectionComponent* joint = nullptr;
+			float jointDist = 0.f;
+			if( d1e <= 4.f * kJointTolerance )       { joint = c1; jointDist = d1e; }
+			else if( d0e <= 4.f * kJointTolerance )  { joint = c0; jointDist = d0e; }
+			if( !joint )
 			{
-				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new belt %s ignored: end %.0f cm from the expected joint (id match %d)" ), *candidate->GetName(), endDist, idMatch ? 1 : 0 );
+				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new belt %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
+					*candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
 				continue;
 			}
 			plan.LastBelt = candidate;
+			plan.JointConnection = joint;
 			plan.bWaiting = false;
-			UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms: %s (id match %d, start %.0f cm and end %.0f cm from expected)" ),
-				plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, *candidate->GetName(), idMatch ? 1 : 0, startDist, endDist );
+			UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] piece %d of %d arrived after %.0f ms: %s (id match %d, joint is %s, %.0f cm from expected)" ),
+				plan.NextPiece, plan.Pieces.Num(), ( FPlatformTime::Seconds() - plan.SentAt ) * 1000.0, *candidate->GetName(), idMatch ? 1 : 0,
+				joint == c1 ? TEXT( "connection1/output (drawn with the flow)" ) : TEXT( "connection0/input (drawn against the flow)" ), jointDist );
 			break;
 		}
 		if( plan.bWaiting )
@@ -498,7 +506,8 @@ void FSegmentedSplinesHooks::SendNextPiece()
 		return;
 	}
 	AFGBuildableConveyorBelt* previous = plan.LastBelt.Get();
-	if( !previous || !previous->GetConnection1() )
+	UFGFactoryConnectionComponent* jointConnection = plan.JointConnection.Get();
+	if( !previous || !jointConnection )
 	{
 		AbortChain( TEXT( "the previous piece vanished" ) );
 		return;
@@ -511,7 +520,7 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	// The built belt's output is where this piece really starts. Move the piece's first point onto
 	// it (the server may have adjusted the end by a few cm); anything larger means it is not our belt.
 	{
-		const FVector connector = previous->GetConnection1()->GetConnectorLocation();
+		const FVector connector = jointConnection->GetConnectorLocation();
 		const FVector delta = connector - plan.Pieces[ i ][ 0 ].Location;
 		if( delta.Size() > 4.f * kJointTolerance )
 		{
@@ -529,8 +538,11 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	// Start: snapped to the previous belt's output, so the two connect. Vanilla hides the start
 	// supports for a snapped start; this hologram never went through that step, so do it by hand.
 	holo->SetActorTransform( plan.Frame );
-	holo->mSnappedConnectionComponents[ 0 ] = previous->GetConnection1();
+	holo->mSnappedConnectionComponents[ 0 ] = jointConnection;
 	holo->mSnappedWallPassthrough[ 0 ] = nullptr;
+	// Flow direction follows from what the start is snapped to (an output feeds this piece, an
+	// input is fed by it); this is vanilla's own routine for that.
+	holo->SetupSnappedConnectionDirections();
 	{
 		FEndSupports startSupports = GetBeltSupports( holo, 0 );
 		if( startSupports.Pole && !startSupports.Pole->IsDisabled() ) DisableSupport( startSupports.Pole );

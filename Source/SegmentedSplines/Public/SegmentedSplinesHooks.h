@@ -15,6 +15,7 @@ class AFGConveyorBeltHologram;
 class AFGRailroadTrackHologram;
 class AFGPipelineHologram;
 class AFGBuildableConveyorBelt;
+class UFGFactoryConnectionComponent;
 class UFGBuildGunStateBuild;
 class UFGRecipe;
 class FArchive;
@@ -117,6 +118,8 @@ private:
 		FVector WaitEnd = FVector::ZeroVector;
 		double SentAt = 0.0;
 		TWeakObjectPtr< AFGBuildableConveyorBelt > LastBelt;
+		/** The built belt's connector at the joint, whichever of its two it turned out to be. */
+		TWeakObjectPtr< UFGFactoryConnectionComponent > JointConnection;
 	};
 
 	// --- phase 1: cut at the limit (pipes; also used for the belt pieces' joints) -------------

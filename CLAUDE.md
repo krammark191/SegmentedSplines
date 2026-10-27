@@ -168,9 +168,12 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   qualify (`KnownBelts` snapshot): client IDs restart every launch, so a belt from an earlier
   session carries the same NetPlayerID/Client_ID (fourth run matched the previous session's
   piece after 24 ms and snapped piece 2 onto it: "hologram jumped back, invalid shape"). The
-  far end must be within 100 cm of the expected joint; the start may differ (vanilla can weld a
-  new belt into the one it starts from). The built belt's output then becomes piece i's first
-  point. Pieces are stored in world space and applied in the hologram's current transform
+  far end must be within 100 cm of the expected joint at EITHER connector: a belt stores its
+  spline in flow direction (connection0 = input, connection1 = output) and the server reverses
+  the points when the player drags against the flow (fifth run: the built belt arrived in
+  150 ms with c0 at the far end and c1 at the start, and was ignored for 10 s). The connector at
+  the joint becomes piece i's start snap and its location piece i's first point;
+  `SetupSnappedConnectionDirections()` then sets the piece's flow from that snap. Pieces are stored in world space and applied in the hologram's current transform
   (`ApplyPiece`), so vanilla moving the hologram during final-end placement cannot skew them.
   On abort, a hologram the driver configured is discarded with `ResetHologram()` (protected;
   `UFGBuildGunStateBuild` is in the Friend list for it). Third run: trigger and piece 1 worked,

@@ -128,6 +128,8 @@ private:
 		bool bHasPendingId = false;
 		/** Buildables that already existed when the piece was sent; the built one is one not in here. */
 		TSet< TWeakObjectPtr< AActor > > Known;
+		/** New buildables that turned out not to be ours, so they are logged only once. */
+		TSet< TWeakObjectPtr< AActor > > Reported;
 		/** Whether the build gun's current hologram was configured by the driver (reset it on abort). */
 		bool bHologramIsOurs = false;
 		/** Waiting for the buildable of piece NextPiece-1 to replicate. */
@@ -160,6 +162,9 @@ private:
 
 	// --- hooks (one set per hologram class, all funnelled here) --------------------------------
 
+	/** True for the hologram the build gun itself holds; false for a child of another hologram (a
+	 *  blueprint's bridge spline, a train platform's track), which goes out inside its parent's message. */
+	static bool IsBuildGunHologram( AFGSplineHologram* hologram );
 	/** @param bRequireDragStep  true while validating (the player is still dragging); false at build time. */
 	static bool IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep );
 	static void OnCheckValidPlacement( AFGSplineHologram* self );

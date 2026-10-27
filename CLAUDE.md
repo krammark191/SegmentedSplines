@@ -51,8 +51,24 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   hypertube does use `AFGPipelineHologram` (its limit is 100 m; earlier logs show `[pipeline]`
   trims at that limit). Twelfth run (hypertube, wall support to wall support) crashed the game
   inside `AFGPipelineHologram::ValidatePipeline` because the chain had emptied
-  `mSnappedPassthroughs`; fixed by nulling its slots instead (see Phase 2 section). Pipe and
-  track chains are still unproven; the track path has the most guesses.
+  `mSnappedPassthroughs`; fixed by nulling its slots instead (see Phase 2 section).
+- **Pipe and track chains proven on a vanilla server (2026-10-27, thirteenth run).** 42 hypertube
+  chains (each 100-115 m into two pieces, far end snapped to the next hypertube support or
+  junction, pieces back in ~140 ms) and three railroad track chains (219 m into three pieces, two
+  178-182 m into two) all completed; the track start snap went through vanilla's overlap snap
+  every time and the final track click was accepted at step 2 as recorded. One failure in the
+  same session: the player placed a double-track blueprint 177 m from two existing track ends.
+  Vanilla's blueprint open-connection manager spawns a bridge track hologram per open rail
+  connection (`FGBlueprintOpenRailroadConnectionManager`, `IsBridgeHologramInvalid`), each a
+  child hologram serialised inside the blueprint's message with the blueprint's construction
+  ID. The serializer trigger fired on both bridges (no DoMultiStepPlacement, two serialisations
+  with one ID, lengths 177 m and 181 m), reshaped them into piece 1, the chain restarted on the
+  second, and the server refused the whole blueprint. Fixed: `IsBuildGunHologram` (no parent
+  hologram, and the build state's `GetHologram()` is this one) is now part of every candidate
+  check, so bridges and a train platform's track hologram are left to vanilla (which shows the
+  blueprint red "too long" as it always did). A later 77 m / 70 m bridge pair in the same session
+  built fine untouched. The crash folder from the end of that session is the crash reporter
+  firing on a normal quit (`RequestExit` from the exit command, clean `LogExit` shutdown).
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

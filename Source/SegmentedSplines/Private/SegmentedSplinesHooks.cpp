@@ -343,9 +343,24 @@ FVector FSegmentedSplinesHooks::KindConnectorLocation( const FSplineKind* kind, 
 // Hooks
 // ---------------------------------------------------------------------------------------------
 
+bool FSegmentedSplinesHooks::IsBuildGunHologram( AFGSplineHologram* hologram )
+{
+	// A blueprint with open rail / belt / pipe connections spawns bridge spline holograms as its
+	// children, and a train platform carries a track hologram of its own. Those serialise inside
+	// their parent's construction message and cannot be sent in pieces: only the hologram the
+	// build gun itself holds is ours to chain. (Thirteenth run: a double-track blueprint placed
+	// 177 m from the existing track ends had both bridges intercepted and the server refused.)
+	if( hologram->GetParentHologram() )
+	{
+		return false;
+	}
+	UFGBuildGunStateBuild* buildState = FindBuildState( hologram );
+	return buildState && buildState->GetHologram() == hologram;
+}
+
 bool FSegmentedSplinesHooks::IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep )
 {
-	if( !hologram || !kind || sDriverBusy || !hologram->IsLocalHologram() )
+	if( !hologram || !kind || sDriverBusy || !hologram->IsLocalHologram() || !IsBuildGunHologram( hologram ) )
 	{
 		return false;
 	}
@@ -415,10 +430,10 @@ void FSegmentedSplinesHooks::OnAfterMultiStepPlacement( bool bFinalStep, AFGSpli
 	{
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)%s" ),
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s DoMultiStepPlacement -> %s, step %d, length %.0f (limit %.0f)%s%s" ),
 		kind->Name, bFinalStep ? TEXT( "final" ) : TEXT( "more steps" ), static_cast< int32 >( self->GetCurrentBuildStep() ),
 		self->mSplineComponent ? self->mSplineComponent->GetSplineLength() : -1.f, KindMaxLength( kind, self ),
-		sDriverBusy ? TEXT( " [driver]" ) : TEXT( "" ) );
+		sDriverBusy ? TEXT( " [driver]" ) : TEXT( "" ), self->GetParentHologram() ? TEXT( " [child hologram]" ) : TEXT( "" ) );
 	if( bFinalStep && !sDriverBusy )
 	{
 		StartChain( self, kind, TEXT( "DoMultiStepPlacement" ) );
@@ -433,9 +448,10 @@ void FSegmentedSplinesHooks::OnSerializeConstructMessage( IFGConstructionMessage
 	{
 		return;
 	}
-	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s SerializeConstructMessage %s id=%s, step %d, length %.0f, local %d, driver busy %d" ),
+	UE_LOG( LogSegmentedSplines, Log, TEXT( "[diag] %s SerializeConstructMessage %s id=%s, step %d, length %.0f, local %d, driver busy %d%s" ),
 		kind->Name, ar.IsSaving() ? TEXT( "saving" ) : TEXT( "loading" ), *id.ToString(), static_cast< int32 >( hologram->GetCurrentBuildStep() ),
-		hologram->mSplineComponent ? hologram->mSplineComponent->GetSplineLength() : -1.f, hologram->IsLocalHologram() ? 1 : 0, sDriverBusy ? 1 : 0 );
+		hologram->mSplineComponent ? hologram->mSplineComponent->GetSplineLength() : -1.f, hologram->IsLocalHologram() ? 1 : 0, sDriverBusy ? 1 : 0,
+		hologram->GetParentHologram() ? TEXT( " [child hologram]" ) : TEXT( "" ) );
 	// Loading happens on the server and on the client's pending-construction copy; neither is ours.
 	if( ar.IsSaving() && !sDriverBusy )
 	{
@@ -716,8 +732,14 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 			else if( d0e <= 4.f * kJointTolerance )  { joint = c0; jointDist = d0e; }
 			if( !joint )
 			{
-				UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new %s %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
-					kind->Name, *candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
+				// Other players' builds replicate in while we wait; say so once per actor, not per tick.
+				bool bAlreadyReported = false;
+				plan.Reported.Add( candidate, &bAlreadyReported );
+				if( !bAlreadyReported )
+				{
+					UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new %s %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
+						kind->Name, *candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
+				}
 				return true;
 			}
 			plan.Last = candidate;

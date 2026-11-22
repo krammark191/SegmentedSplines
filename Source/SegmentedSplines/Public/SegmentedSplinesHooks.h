@@ -130,6 +130,9 @@ private:
 		 *  vanilla places it from a straighter route (and after any rotation the player chose). */
 		FRotator EndPoleRotation = FRotator::ZeroRotator;
 		bool bHasEndPoleRotation = false;
+		/** Pipe supports also tilt their top part to the pipe's slope; copied the same way. */
+		float EndPoleVerticalAngle = 0.f;
+		bool bHasEndPoleVerticalAngle = false;
 		/** The build step the player's hologram was on when its click was accepted as final. */
 		ESplineHologramBuildStep FinalStep = ESplineHologramBuildStep::SHBS_AdjustPole;
 		/** Index of the next piece to send. */
@@ -178,6 +181,8 @@ private:
 	static void KindForEachBuildable( const FSplineKind* kind, UWorld* world, TFunctionRef< bool( AFGBuildable* ) > visit );
 	static UFGConnectionComponent* KindConnection( const FSplineKind* kind, AFGBuildable* buildable, int32 index );
 	static FVector KindConnectorLocation( const FSplineKind* kind, UFGConnectionComponent* connection );
+	/** The connector on a support pole that the spline end sits on (null for tracks). */
+	static UFGConnectionComponent* KindPoleSnapConnection( const FSplineKind* kind, AFGPoleHologram* pole );
 
 	// --- hooks (one set per hologram class, all funnelled here) --------------------------------
 

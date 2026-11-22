@@ -337,6 +337,22 @@ UFGConnectionComponent* FSegmentedSplinesHooks::KindConnection( const FSplineKin
 	return nullptr;
 }
 
+UFGConnectionComponent* FSegmentedSplinesHooks::KindPoleSnapConnection( const FSplineKind* kind, AFGPoleHologram* pole )
+{
+	switch( kind->Type )
+	{
+	case ESplineKind::Belt:
+		if( AFGConveyorPoleHologram* conveyorPole = Cast< AFGConveyorPoleHologram >( pole ) ) return conveyorPole->GetSnapConnection();
+		break;
+	case ESplineKind::Pipe:
+		if( AFGPipelinePoleHologram* pipePole = Cast< AFGPipelinePoleHologram >( pole ) ) return pipePole->GetSnapConnection();
+		break;
+	case ESplineKind::Track:
+		break;
+	}
+	return nullptr;
+}
+
 FVector FSegmentedSplinesHooks::KindConnectorLocation( const FSplineKind* kind, UFGConnectionComponent* connection )
 {
 	switch( kind->Type )
@@ -569,6 +585,11 @@ bool FSegmentedSplinesHooks::PlanChain( AFGSplineHologram* hologram, const FSpli
 		{
 			plan->EndPoleRotation = endPole->GetActorRotation();
 			plan->bHasEndPoleRotation = true;
+			if( const AFGPipelinePoleHologram* pipePole = Cast< AFGPipelinePoleHologram >( endPole ) )
+			{
+				plan->EndPoleVerticalAngle = pipePole->GetVerticalAngle();
+				plan->bHasEndPoleVerticalAngle = true;
+			}
 		}
 	}
 
@@ -930,9 +951,11 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	}
 	else if( AFGPoleHologram* endPole = KindSupports( kind, holo, 1 ).Pole )
 	{
-		// Vanilla turned the end pole to face the end of ITS route (previous connector straight to
-		// the cursor), which is not where our curve arrives from. Give it back the yaw the player's
-		// full hologram showed, or failing that the curve's own arrival direction.
+		// Vanilla placed the end pole for the end of ITS route (previous connector straight to the
+		// cursor), which is not where our curve arrives from: wrong yaw, for pipes a wrong tilt of
+		// the top part, and the pole's connector no longer under the curve's end. Give it back what
+		// the player's full hologram showed (or the curve's own arrival direction), then put the
+		// pole under the end and the end on the pole's connector.
 		if( !endPole->IsDisabled() )
 		{
 			FRotator poleRotation = endPole->GetActorRotation();
@@ -951,7 +974,48 @@ void FSegmentedSplinesHooks::SendNextPiece()
 				source = TEXT( "curve's arrival direction" );
 			}
 			endPole->SetActorRotation( poleRotation );
-			UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece's end pole turned to yaw %.1f (%s)" ), poleRotation.Yaw, source );
+			if( plan.bHasEndPoleVerticalAngle )
+			{
+				if( AFGPipelinePoleHologram* pipePole = Cast< AFGPipelinePoleHologram >( endPole ) )
+				{
+					pipePole->SetVerticalAngle( plan.EndPoleVerticalAngle );
+				}
+			}
+			UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece's end pole turned to yaw %.1f (%s)%s" ), poleRotation.Yaw, source,
+				plan.bHasEndPoleVerticalAngle ? *FString::Printf( TEXT( ", top tilted %.1f deg" ), plan.EndPoleVerticalAngle ) : TEXT( "" ) );
+
+			if( UFGConnectionComponent* snap = KindPoleSnapConnection( kind, endPole ) )
+			{
+				const FTransform frame = holo->GetActorTransform();
+				const FVector end = frame.TransformPosition( holo->mSplineData.Last().Location );
+				FVector offset = end - KindConnectorLocation( kind, snap );
+				const FVector sideways( offset.X, offset.Y, 0.f );
+				if( sideways.Size() > 1.f )
+				{
+					endPole->SetActorLocation( endPole->GetActorLocation() + sideways );
+				}
+				offset = end - KindConnectorLocation( kind, snap );
+				const TCHAR* vertical = TEXT( "left" );
+				if( FMath::Abs( offset.Z ) > 0.5f && FMath::Abs( offset.Z ) <= kMaxPoleSeatNudge )
+				{
+					// Same as a seated joint: the end goes onto the connector, unless that would make
+					// the piece too long.
+					TArray< FSplinePointData > nudged = holo->mSplineData;
+					nudged.Last().Location -= frame.InverseTransformVector( FVector( 0.f, 0.f, offset.Z ) );
+					SetSplineData( holo, kind, MoveTemp( nudged ) );
+					if( holo->mSplineComponent->GetSplineLength() > maxLength )
+					{
+						ApplyPiece( holo, kind, plan.Pieces[ i ] );
+						vertical = TEXT( "left, nudging would exceed the limit" );
+					}
+					else
+					{
+						vertical = TEXT( "end nudged onto the connector" );
+					}
+				}
+				UE_LOG( LogSegmentedSplines, Log, TEXT( "[chain] final pole's connector was %.1f cm sideways and %.1f cm below the curve end: pole %s, height %s" ),
+					sideways.Size(), offset.Z, sideways.Size() > 1.f ? TEXT( "moved under the end" ) : TEXT( "already under it" ), vertical );
+			}
 		}
 	}
 
@@ -1382,7 +1446,7 @@ void FSegmentedSplinesHooks::UpdateLengthLabel( AFGSplineHologram* hologram, con
 		eye = pawn->GetPawnViewLocation();
 	}
 	const float distance = FVector::Dist( eye, end );
-	const float worldSize = FMath::Clamp( distance * 0.015f, 25.f, 400.f );
+	const float worldSize = FMath::Clamp( distance * 0.02f, 35.f, 500.f );
 	const FVector position = end + FVector( 0.f, 0.f, FMath::Max( 150.f, distance * 0.03f ) );
 	const FVector toEye = eye - position;
 	const FRotator facing = toEye.IsNearlyZero() ? FRotator::ZeroRotator : FRotationMatrix::MakeFromX( toEye ).Rotator();

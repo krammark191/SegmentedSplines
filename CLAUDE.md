@@ -107,6 +107,16 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   `SendNextPiece` sets the final pole's yaw back to it after `ApplyPiece` (fallback: the
   curve's arrival direction); a Verbose line logs which. Also added (user request): a length
   readout, see "Length readout" in the Phase 2 section.
+- **Fifteenth run (2026-11-21):** readout seen and liked ("bump its font size up a little":
+  now 2 % of the camera distance, 35-500 cm). Belt and track final supports fine; pipe and
+  hypertube final supports "not off angle this time, but offset" (both chains built, the log
+  has no position data for the final pole). Fix (not yet seen in-game): after the yaw, the
+  driver also copies the pipe support's top tilt (`AFGPipelinePoleHologram::GetVerticalAngle`
+  / `SetVerticalAngle`, recorded in `FChainPlan::EndPoleVerticalAngle`), then compares the
+  pole's snap connector (`KindPoleSnapConnection`: conveyor / pipeline pole `GetSnapConnection`)
+  with the curve's end: the pole is moved sideways under the end and the end nudged onto the
+  connector (<= `kMaxPoleSeatNudge`, unless that pushes the piece over the limit). A Log line
+  reports the sideways and vertical offset it found, which is the number to read next time.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

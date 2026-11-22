@@ -72,12 +72,36 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   User confirmed after the fix (2026-10-27): "It works as intended now."
 - **Joint-support preview added (2026-10-27, not yet seen in-game).** Pole meshes now stand
   under the planned joints while the player drags a chain candidate; see the Phase 2 section.
+- **Game update broke belt chains (found 2026-11-21).** Steam updated the game on 2026-11-18 to
+  1.2.6, changelist 520140 (`LogInit: Build:` line; crash contexts show CL 502094 in September,
+  513885 from 2026-10-12). The starter project's headers were still at CL 513885. In 520140
+  `AFGBuildableConveyorBase` gained a second interface base (`IFGFactoryConnectionStateOwner`)
+  and a replicated `mFactoryConnectionStates` member, so every field after them moved, and the
+  inline `GetConnection0/1()` compiled into the mod read the wrong pointers: "connection1" came
+  back at the belt's start (really connection0) and "connection0" at the world origin, for
+  every new belt including ones the player built by hand, so the chain never recognised piece 1
+  and timed out (today, and 2026-11-19 where the player's hand-built belt at the joint was then
+  mistaken for piece 1 and piece 2 failed clearance on it). Hypertubes and tracks were unaffected
+  because their classes did not change. Fix: `git pull` the starter (header commits "Update
+  headers to CL517554/CL520140", SML 3.12.1), rebuild, `GameVersion` in the uplugin raised to
+  `>=520140` so SML refuses to load this build on an older game. Rule: **after any game update,
+  compare the log's `LogInit: Build:` changelist with the starter's last "Update headers" commit
+  and rebuild before testing anything.** The chain now logs a Warning when a buildable with our
+  construction ID has a connector at the world origin, which is this failure's signature.
+  The CL 520140 headers also need the custom engine release **5.6.1-css-87** (the header tool
+  failed on `FClientInitialLoadStatusData`, missing from css-83): downloaded from the
+  satisfactorymodding/UnrealEngine GitHub release (`UnrealEngine-CSS-Editor-Linux.tar.zst.00-04`,
+  8.8 GB, `cat parts | tar --zstd -x`), extracted to a fresh directory and swapped in at the
+  registered path; css-83 kept at `~/UnrealEngineCSS-css83`. Editor build 18 against css-87 and
+  the new headers passed (full rebuild, ~7 min, no mod warnings); Win64 package 17 is the build
+  installed in the game. Rule: **a game update may need a new engine release too**; check the
+  releases page when the header tool fails on an unknown engine type.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
   SatisfactoryModLoader starter project at `Mods/SegmentedSplines`.
 - Linux PC layout: starter project `~/Projects/SatisfactoryModLoader` (master), engine
-  `~/UnrealEngineCSS` registered as `UE_5.6.1-CSS`, MSVC via msvc-wine at `~/msvc`
+  `~/UnrealEngineCSS` (5.6.1-css-87 since 2026-11-21) registered as `UE_5.6.1-CSS`, MSVC via msvc-wine at `~/msvc`
   (`UE_WINE_MSVC`), Wwise SDK cached by `~/tools/wwise-cli`. Build the editor with
   `~/UnrealEngineCSS/Engine/Build/BatchFiles/Linux/Build.sh FactoryEditor Linux Development -project=<starter>/FactoryGame.uproject`
   (about 7 min incremental); a Makefile exists at the starter root (`make FactoryEditor`).
@@ -338,6 +362,9 @@ Docs (docs.ficsit.app/satisfactory-modding/latest/...):
 ## Conventions
 
 - Mod reference `SegmentedSplines` is permanent once released on SMR; don't rename.
+- `GameVersion` in the uplugin must be the changelist of the headers the binary was built
+  against (currently `>=520140`); raise it with every header update, and keep the starter's
+  headers in step with the installed game (see the 2026-11-21 status entry).
 - Keep `RequiredOnRemote: false`. Keep `Config/Alpakit.ini` targets to `Windows` only (the Proton
   game is the Windows build; Linux docs note Wine is needed to build the Win64 target).
 - `Resources/Icon128.png` is still missing; needed before an SMR upload.

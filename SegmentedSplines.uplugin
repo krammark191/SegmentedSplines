@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "0.1.0",
 	"SemVersion": "0.1.0",
-	"GameVersion": ">=491125",
+	"GameVersion": ">=520140",
 	"FriendlyName": "Segmented Splines",
 	"Description": "Drag a belt, pipe, hypertube or rail hologram past its length limit and it builds the longest legal piece along the curve you aimed for, instead of refusing. Client-side only; works on vanilla servers.",
 	"Category": "Modding",

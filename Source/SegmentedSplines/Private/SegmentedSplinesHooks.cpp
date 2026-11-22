@@ -748,6 +748,16 @@ bool FSegmentedSplinesHooks::TickChain( float deltaTime )
 				{
 					UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] new %s %s ignored: neither connector at the expected joint (c1 %.0f cm, c0 %.0f cm away; id match %d)" ),
 						kind->Name, *candidate->GetName(), d1e, d0e, idMatch ? 1 : 0 );
+					// A connector at the world origin is not a place a built spline can have an end. The
+					// one time it happened (game 1.2.6, headers from an older changelist) the buildable's
+					// class layout had changed and the inline connector getters read the wrong pointers.
+					const FVector l0 = KindConnectorLocation( kind, c0 );
+					const FVector l1 = KindConnectorLocation( kind, c1 );
+					if( idMatch && ( l0.IsNearlyZero( 1.f ) || l1.IsNearlyZero( 1.f ) ) )
+					{
+						UE_LOG( LogSegmentedSplines, Warning, TEXT( "[chain] %s %s carries our construction ID but a connector reads at the world origin: the mod was probably built against headers older than this game build; rebuild it against the current changelist" ),
+							kind->Name, *candidate->GetName() );
+					}
 				}
 				return true;
 			}

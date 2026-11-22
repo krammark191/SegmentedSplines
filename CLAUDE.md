@@ -116,7 +116,13 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   pole's snap connector (`KindPoleSnapConnection`: conveyor / pipeline pole `GetSnapConnection`)
   with the curve's end: the pole is moved sideways under the end and the end nudged onto the
   connector (<= `kMaxPoleSeatNudge`, unless that pushes the piece over the limit). A Log line
-  reports the sideways and vertical offset it found, which is the number to read next time.
+  reports the sideways and vertical offset it found.
+- **Sixteenth run (2026-11-21), user: "Everything looks good."** The offset line confirmed the
+  cause: vanilla's end placement for the fresh final hologram put the pipe support's connector
+  199, 283, 14 and 132 cm sideways from the curve's end (four pipe/hypertube chains) and only
+  7 cm for a belt; vertical offset 0 in every case, top tilt 0. So pipe supports are placed
+  along vanilla's own route, not at the hit, and the sideways move is what fixes them. Belt,
+  track, pipe and hypertube chains all built on the vanilla server in this run.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the

@@ -70,8 +70,9 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   built fine untouched. The crash folder from the end of that session is the crash reporter
   firing on a normal quit (`RequestExit` from the exit command, clean `LogExit` shutdown).
   User confirmed after the fix (2026-10-27): "It works as intended now."
-- **Joint-support preview added (2026-10-27, not yet seen in-game).** Pole meshes now stand
-  under the planned joints while the player drags a chain candidate; see the Phase 2 section.
+- **Joint-support preview added (2026-10-27).** Pole meshes now stand under the planned joints
+  while the player drags a chain candidate; see the Phase 2 section. Seen in-game 2026-11-21
+  ("midway supports are looking good").
 - **Game update broke belt chains (found 2026-11-21).** Steam updated the game on 2026-11-18 to
   1.2.6, changelist 520140 (`LogInit: Build:` line; crash contexts show CL 502094 in September,
   513885 from 2026-10-12). The starter project's headers were still at CL 513885. In 520140
@@ -96,6 +97,16 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   the new headers passed (full rebuild, ~7 min, no mod warnings); Win64 package 17 is the build
   installed in the game. Rule: **a game update may need a new engine release too**; check the
   releases page when the header tool fails on an unknown engine type.
+- **Fourteenth run (2026-11-21, after the rebuild):** belt (3 pieces), track (2), hypertube
+  (2) and fluid pipe (2) chains all built on the vanilla server, pieces back in 116-155 ms.
+  User: midway supports look good, "the final support is off-angle". Cause: for the final
+  piece the driver lets vanilla place the end from the cursor hit, and vanilla turns the end
+  pole to face the end of ITS route (previous connector straight to the cursor), not where our
+  curve arrives from. Fix (not yet seen in-game): `PlanChain` records the full hologram's end
+  pole world rotation (`FChainPlan::EndPoleRotation`, only if the pole was enabled) and
+  `SendNextPiece` sets the final pole's yaw back to it after `ApplyPiece` (fallback: the
+  curve's arrival direction); a Verbose line logs which. Also added (user request): a length
+  readout, see "Length readout" in the Phase 2 section.
 - The user plays Satisfactory on this PC through Steam/Proton. The modding toolchain is the
   native Linux one (see README "Getting it building"). The Mac cannot build the custom engine.
 - This repo is the single source of truth. Commit and push from here. It is cloned into the
@@ -309,7 +320,20 @@ air built fine with the pole disabled (free end), so sending one legal piece aft
   `Client_OnBuildableFailedConstruction` RPC for the pending ID (hooked on its `_Implementation`
   through the build state CDO), hologram gone or recipe changed, previous belt gone, piece not
   constructible (disqualifier names are logged).
-- Joint preview (written 2026-10-27, not yet seen in-game): while the full hologram is a chain
+- Length readout (written 2026-11-21, not yet seen in-game): `UpdateLengthLabel` runs from the
+  after-hook for every hologram the player is dragging (`IsPlayerDragging`: the non-length half
+  of `IsChainCandidate`), over or under the limit. One `UTextRenderComponent` per hologram
+  (`FJointPreview::Label`, owned by the hologram, transient, no collision) floats above the
+  last spline point, offset max(150 cm, 3 % of the camera distance), world size 1.5 % of that
+  distance clamped to 25-400 cm, facing the camera (`FRotationMatrix::MakeFromX(eye - pos)`;
+  the engine's text faces local +X and reads along -Y), text "%.1f m<br>%d section(s)" with
+  N = max(1, ceil(L / (limit - margin))). The font and material are the engine's text defaults
+  (`RobotoDistanceField`, `DefaultTextMaterialOpaque`); the game's own
+  `UFGBoundedTextRenderComponent` uses the same class defaults, so they are cooked; a Warning
+  is logged once if the font is null. `ClearJointPreview(hologram, bKeepLabel)` drops only the
+  pole meshes when the hologram is still dragged but under the limit (or is a track); a full
+  clear happens when the drag ends and in `StartChain`.
+- Joint preview (written 2026-10-27, seen in-game 2026-11-21): while the full hologram is a chain
   candidate, `OnAfterCheckValidPlacement` calls `UpdateJointPreview`, which computes the N-1
   joint points along `mSplineComponent` (same cut as `PlanChain`), runs the same floor trace
   and fixed-height choice as `SeatOrDisableEndPole` (shared `FindFloorBelow`), and for each

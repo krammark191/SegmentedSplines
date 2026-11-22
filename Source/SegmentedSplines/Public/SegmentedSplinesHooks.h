@@ -17,6 +17,7 @@ class UFGConnectionComponent;
 class UFGBuildGunStateBuild;
 class UFGRecipe;
 class UStaticMeshComponent;
+class UTextRenderComponent;
 class FArchive;
 class IFGConstructionMessageInterface;
 
@@ -125,6 +126,10 @@ private:
 		/** What the cursor hit when the player placed the far end; recreates vanilla's end support. */
 		FHitResult EndHit;
 		bool bHasEndHit = false;
+		/** World rotation of the player's far-end pole, re-applied to the final piece's pole after
+		 *  vanilla places it from a straighter route (and after any rotation the player chose). */
+		FRotator EndPoleRotation = FRotator::ZeroRotator;
+		bool bHasEndPoleRotation = false;
 		/** The build step the player's hologram was on when its click was accepted as final. */
 		ESplineHologramBuildStep FinalStep = ESplineHologramBuildStep::SHBS_AdjustPole;
 		/** Index of the next piece to send. */
@@ -153,6 +158,8 @@ private:
 	struct FJointPreview
 	{
 		TArray< TWeakObjectPtr< UStaticMeshComponent > > Meshes;
+		/** Length and section-count readout floating over the far end. */
+		TWeakObjectPtr< UTextRenderComponent > Label;
 	};
 
 	// --- per-type knowledge --------------------------------------------------------------------
@@ -177,6 +184,9 @@ private:
 	/** True for the hologram the build gun itself holds; false for a child of another hologram (a
 	 *  blueprint's bridge spline, a train platform's track), which goes out inside its parent's message. */
 	static bool IsBuildGunHologram( AFGSplineHologram* hologram );
+	/** The hologram the player is dragging with the build gun: local, not a child, on a step where the
+	 *  far end is being placed, with a routed spline. The part of IsChainCandidate that is not about length. */
+	static bool IsPlayerDragging( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep );
 	/** @param bRequireDragStep  true while validating (the player is still dragging); false at build time. */
 	static bool IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep );
 	static void OnCheckValidPlacement( AFGSplineHologram* self );
@@ -230,8 +240,11 @@ private:
 
 	/** Show a pole mesh under each joint the chain would make, as the build would seat it. */
 	static void UpdateJointPreview( AFGSplineHologram* hologram, const FSplineKind* kind );
-	/** Remove the preview meshes of one hologram (and forget holograms that are gone). */
-	static void ClearJointPreview( AFGHologram* hologram );
+	/** Remove the preview meshes of one hologram (and forget holograms that are gone). With
+	 *  bKeepLabel the length readout stays: the hologram is still being dragged, just under the limit. */
+	static void ClearJointPreview( AFGHologram* hologram, bool bKeepLabel = false );
+	/** Show the curve's full length and how many pieces it will be built as, over the far end. */
+	static void UpdateLengthLabel( AFGSplineHologram* hologram, const FSplineKind* kind );
 
 	/** Disable a support hologram and remember that it was us, not vanilla, who did it. */
 	static void DisableSupport( AFGHologram* support );

@@ -28,6 +28,10 @@
 
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/TextRenderComponent.h"
+#include "Engine/Font.h"
+#include "Kismet/GameplayStatics.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstance.h"
@@ -363,7 +367,7 @@ bool FSegmentedSplinesHooks::IsBuildGunHologram( AFGSplineHologram* hologram )
 	return buildState && buildState->GetHologram() == hologram;
 }
 
-bool FSegmentedSplinesHooks::IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep )
+bool FSegmentedSplinesHooks::IsPlayerDragging( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep )
 {
 	if( !hologram || !kind || sDriverBusy || !hologram->IsLocalHologram() || !IsBuildGunHologram( hologram ) )
 	{
@@ -374,11 +378,16 @@ bool FSegmentedSplinesHooks::IsChainCandidate( AFGSplineHologram* hologram, cons
 	{
 		return false;
 	}
-	const float maxLength = KindMaxLength( kind, hologram );
-	if( !hologram->mSplineComponent || hologram->mSplineData.Num() < 2 || maxLength <= 0.f )
+	return hologram->mSplineComponent && hologram->mSplineData.Num() >= 2 && KindMaxLength( kind, hologram ) > 0.f;
+}
+
+bool FSegmentedSplinesHooks::IsChainCandidate( AFGSplineHologram* hologram, const FSplineKind* kind, bool bRequireDragStep )
+{
+	if( !IsPlayerDragging( hologram, kind, bRequireDragStep ) )
 	{
 		return false;
 	}
+	const float maxLength = KindMaxLength( kind, hologram );
 	const float length = hologram->mSplineComponent->GetSplineLength();
 	if( length <= maxLength )
 	{
@@ -406,9 +415,15 @@ void FSegmentedSplinesHooks::OnCheckValidPlacement( AFGSplineHologram* self )
 void FSegmentedSplinesHooks::OnAfterCheckValidPlacement( AFGSplineHologram* self )
 {
 	const FSplineKind* kind = FindKind( self );
-	if( !IsChainCandidate( self, kind, true ) )
+	if( !IsPlayerDragging( self, kind, true ) )
 	{
 		ClearJointPreview( self );
+		return;
+	}
+	UpdateLengthLabel( self, kind );
+	if( !IsChainCandidate( self, kind, true ) )
+	{
+		ClearJointPreview( self, true );
 		return;
 	}
 	// Vanilla has just judged the full curve too long. Every piece we will send is under the limit,
@@ -547,6 +562,14 @@ bool FSegmentedSplinesHooks::PlanChain( AFGSplineHologram* hologram, const FSpli
 	{
 		plan->EndHit = *hit;
 		plan->bHasEndHit = true;
+	}
+	if( AFGPoleHologram* endPole = KindSupports( kind, hologram, 1 ).Pole )
+	{
+		if( !endPole->IsDisabled() )
+		{
+			plan->EndPoleRotation = endPole->GetActorRotation();
+			plan->bHasEndPoleRotation = true;
+		}
 	}
 
 	// Cut the curve into equal pieces. The game's splitter works on a spline component, so the
@@ -905,6 +928,32 @@ void FSegmentedSplinesHooks::SendNextPiece()
 	{
 		SeatOrDisableEndPole( holo, kind, maxLength - kSafetyMargin, KindSupports( kind, holo, 1 ), TEXT( "chain joint" ) );
 	}
+	else if( AFGPoleHologram* endPole = KindSupports( kind, holo, 1 ).Pole )
+	{
+		// Vanilla turned the end pole to face the end of ITS route (previous connector straight to
+		// the cursor), which is not where our curve arrives from. Give it back the yaw the player's
+		// full hologram showed, or failing that the curve's own arrival direction.
+		if( !endPole->IsDisabled() )
+		{
+			FRotator poleRotation = endPole->GetActorRotation();
+			const TCHAR* source = TEXT( "player's full hologram" );
+			if( plan.bHasEndPoleRotation )
+			{
+				poleRotation.Yaw = plan.EndPoleRotation.Yaw;
+			}
+			else
+			{
+				const FVector arrive = holo->GetActorTransform().TransformVector( holo->mSplineData.Last().ArriveTangent ).GetSafeNormal2D();
+				if( !arrive.IsNearlyZero() )
+				{
+					poleRotation.Yaw = arrive.Rotation().Yaw;
+				}
+				source = TEXT( "curve's arrival direction" );
+			}
+			endPole->SetActorRotation( poleRotation );
+			UE_LOG( LogSegmentedSplines, Verbose, TEXT( "[chain] final piece's end pole turned to yaw %.1f (%s)" ), poleRotation.Yaw, source );
+		}
+	}
 
 	ValidateForConstruction( holo );
 	if( !holo->CanConstruct() )
@@ -1170,7 +1219,7 @@ void FSegmentedSplinesHooks::UpdateJointPreview( AFGSplineHologram* hologram, co
 	USplineComponent* spline = hologram->mSplineComponent;
 	if( !pole || !poleCdo || poleCdo->GetPoleVariations().Num() == 0 || !spline || !hologram->GetRootComponent() )
 	{
-		ClearJointPreview( hologram );
+		ClearJointPreview( hologram, true );
 		return;
 	}
 
@@ -1260,7 +1309,7 @@ void FSegmentedSplinesHooks::UpdateJointPreview( AFGSplineHologram* hologram, co
 	}
 }
 
-void FSegmentedSplinesHooks::ClearJointPreview( AFGHologram* hologram )
+void FSegmentedSplinesHooks::ClearJointPreview( AFGHologram* hologram, bool bKeepLabel )
 {
 	if( FJointPreview* preview = sPreviews.Find( hologram ) )
 	{
@@ -1271,12 +1320,78 @@ void FSegmentedSplinesHooks::ClearJointPreview( AFGHologram* hologram )
 				mesh->DestroyComponent();
 			}
 		}
-		sPreviews.Remove( hologram );
+		preview->Meshes.Empty();
+		if( !bKeepLabel || !preview->Label.IsValid() )
+		{
+			if( UTextRenderComponent* label = preview->Label.Get() )
+			{
+				label->DestroyComponent();
+			}
+			sPreviews.Remove( hologram );
+		}
 	}
 	for( auto it = sPreviews.CreateIterator(); it; ++it )
 	{
 		if( !it->Key.IsValid() ) it.RemoveCurrent();
 	}
+}
+
+void FSegmentedSplinesHooks::UpdateLengthLabel( AFGSplineHologram* hologram, const FSplineKind* kind )
+{
+	USplineComponent* spline = hologram->mSplineComponent;
+	UWorld* world = hologram->GetWorld();
+	if( !spline || !world || !hologram->GetRootComponent() )
+	{
+		return;
+	}
+	const float maxLength = KindMaxLength( kind, hologram );
+	const float totalLength = spline->GetSplineLength();
+	const int32 numPieces = FMath::Max( 1, FMath::CeilToInt( totalLength / ( maxLength - kSafetyMargin ) ) );
+
+	FJointPreview& preview = sPreviews.FindOrAdd( hologram );
+	UTextRenderComponent* label = preview.Label.Get();
+	if( !label )
+	{
+		// Owned by the hologram, so it disappears with it. The engine's default text font and
+		// material come with the component's class defaults.
+		label = NewObject< UTextRenderComponent >( hologram, NAME_None, RF_Transient );
+		label->SetCollisionEnabled( ECollisionEnabled::NoCollision );
+		label->SetCastShadow( false );
+		label->SetHorizontalAlignment( EHTA_Center );
+		label->SetVerticalAlignment( EVRTA_TextBottom );
+		label->SetTextRenderColor( FColor( 255, 255, 255, 255 ) );
+		label->RegisterComponent();
+		label->AttachToComponent( hologram->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform );
+		preview.Label = label;
+		if( !label->Font )
+		{
+			UE_LOG( LogSegmentedSplines, Warning, TEXT( "[%s] the text component has no font: the length readout will not be visible" ), kind->Name );
+		}
+	}
+
+	// Over the far end, where the player is looking, facing the camera and sized with the distance
+	// so it reads the same from across the map as from up close.
+	const FVector end = spline->GetLocationAtSplinePoint( spline->GetNumberOfSplinePoints() - 1, ESplineCoordinateSpace::World );
+	FVector eye = end;
+	if( APlayerCameraManager* camera = UGameplayStatics::GetPlayerCameraManager( world, 0 ) )
+	{
+		eye = camera->GetCameraLocation();
+	}
+	else if( APawn* pawn = Cast< APawn >( hologram->GetConstructionInstigator() ) )
+	{
+		eye = pawn->GetPawnViewLocation();
+	}
+	const float distance = FVector::Dist( eye, end );
+	const float worldSize = FMath::Clamp( distance * 0.015f, 25.f, 400.f );
+	const FVector position = end + FVector( 0.f, 0.f, FMath::Max( 150.f, distance * 0.03f ) );
+	const FVector toEye = eye - position;
+	const FRotator facing = toEye.IsNearlyZero() ? FRotator::ZeroRotator : FRotationMatrix::MakeFromX( toEye ).Rotator();
+
+	label->SetWorldLocationAndRotation( position, facing );
+	label->SetWorldSize( worldSize );
+	label->SetText( FText::FromString( FString::Printf( TEXT( "%.1f m<br>%d section%s" ),
+		totalLength / 100.f, numPieces, numPieces == 1 ? TEXT( "" ) : TEXT( "s" ) ) ) );
+	label->SetVisibility( true );
 }
 
 float FSegmentedSplinesHooks::GetMaxPoleHeight( const AFGPoleHologram* pole )

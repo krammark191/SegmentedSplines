@@ -1,108 +1,101 @@
-# Segmented Splines (draft skeleton)
+# Segmented Splines
 
-A client-side-only Satisfactory mod. Drag a belt, pipe, hypertube or rail hologram past its
-length limit and, instead of a red "too long" hologram, you get the longest legal piece cut from
-the curve you were aiming at. Build it, then start the next piece from its end.
+<img src="Resources/Icon128.png" align="right" width="96" alt="Segmented Splines icon">
 
-Phase 2 (planned) chains the pieces automatically; phase 3 drops a chosen blueprint at each joint.
+A client-side Satisfactory mod. Drag a conveyor belt, pipe, hypertube or railway as far as you
+like, past the per-piece length limit, and build it with one click. The mod cuts the curve you
+aimed for into equal legal pieces and builds them one after another, with a support at every
+joint and a readout of the full length and section count while you drag.
 
-## Why it works on vanilla servers
+Because every piece the game receives is an ordinary, legal construction, it works when joining
+a **vanilla dedicated server** that has no mods and no SML installed.
 
-Only the server constructs. The client serialises its local hologram into a construction message
-and the server re-validates it. This mod only ever changes the *local* hologram so that what the
-client sends is already a legal segment, so a server with no SML and no mods accepts it.
+## What it does
 
-* `RequiredOnRemote: false` in the `.uplugin` is essential. SML 3.9+ clients refuse to join a
-  server that lacks a mod marked required, which would lock you out of vanilla servers.
-* A client with SML can join a server without SML (SML 3.8+). The reverse is not possible, but
-  that direction does not matter here.
+* **Build past the limit.** A belt, pipe, hypertube or railway hologram longer than the limit no
+  longer turns red. Click once and the mod builds it as the fewest equal pieces that fit under the
+  limit (up to 32), each snapped to the previous one.
+* **Supports at the joints.** Where there is floor under a joint, a pole of the right height is
+  seated there; over a gap the joint is left free. While you drag, preview poles show where the
+  joints will be.
+* **The far end is placed by the game.** The last piece ends exactly where your cursor was, on a
+  pole, wall or ceiling mount, or snapped to the machine, junction or wall hole you aimed at.
+* **Length and section readout.** A label above the far end shows the full length in metres and
+  how many sections it will be built as, for every belt, pipe or railway you drag.
+* **Vanilla+.** Nothing about the game's rules changes. Under the limit, building is exactly
+  vanilla. Blueprints, train platforms and the game's own bridge splines are left alone.
 
-## Layout
+## Screenshots
 
-```
-SegmentedSplines/
-  SegmentedSplines.uplugin           mod metadata (RequiredOnRemote=false, SML ^3.12)
-  Config/AccessTransformers.ini      friend access to hologram internals (needs C++ rebuild)
-  Config/Alpakit.ini                 package the Windows client target only
-  Config/PluginSettings.ini          standard template file
-  Resources/                         put a 128x128 Icon128.png here before uploading to SMR
-  Source/SegmentedSplines/
-    SegmentedSplines.Build.cs
-    Public/SegmentedSplines.h        Unreal module
-    Private/SegmentedSplines.cpp     registers hooks (not in editor)
-    Public/SegmentedSplinesHooks.h
-    Private/SegmentedSplinesHooks.cpp  the actual truncation logic
-```
+A Mk.5 belt being built as three pieces across a canyon; the preview poles mark the joints:
 
-## How the hook works
+![A long belt chain being built, with preview poles at the joints](docs/media/belt-chain.png)
 
-* `AFGConveyorBeltHologram`, `AFGRailroadTrackHologram` and `AFGPipelineHologram` all override
-  `CheckValidPlacement`, which the build gun runs every update after the spline has been routed.
-* We install a **pre** hook on each with SML's `SUBSCRIBE_UOBJECT_METHOD`. The hook measures the
-  routed spline; if it is over the class's limit it calls the game's own
-  `FSplineUtils::SplitSplineAtDistance` at (limit - 2 cm), keeps the first half as the hologram's
-  spline data, rebuilds the spline component, and shifts the end pole by the same offset.
-* Vanilla's `CheckValidPlacement` then runs on the trimmed spline and passes.
-* The hook does nothing when the far end is snapped to a connection, so aiming at a machine
-  input still gives vanilla's "too long" instead of a belt that stops short of it.
+The readout above the far end of a 120 m belt about to be built as three sections:
 
-Limits as of this draft: belts and pipes 5600.1 cm (from the headers); rails read `mMaxLength`
-from the Blueprint defaults at runtime.
+![The length and section-count readout above a belt hologram](docs/media/length-readout.png)
 
-## Getting it building on your CachyOS PC
+A one-minute demo of belt, hypertube and railway chains being built:
+[docs/media/chain-demo.mp4](docs/media/chain-demo.mp4)
 
-The Mac cannot build this: the custom Coffee Stain engine is Windows/Linux only. Your Linux PC can.
-Follow the official guide and treat the notes below as the Arch translation of it:
-https://docs.ficsit.app/satisfactory-modding/latest/Development/Linux/LinuxSetup.html
+## Installing
 
-1. Packages. The guide lists Debian/Fedora names; on Arch:
-   ```bash
-   sudo pacman -S --needed git msitools tar zstd dos2unix wine
-   ```
-   Wine is needed for the Wwise authoring tool and to build the Win64 Alpakit target (which is
-   the one your Proton game runs).
-2. MSVC via msvc-wine (`ue-patches` branch), then set `UE_WINE_MSVC` and re-login, per the guide.
-3. Engine access: link GitHub to Epic and to the ficsit linker, then download the
-   `UnrealEngine-CSS-Editor-Linux.tar.zst.*` parts, extract, and register with
-   `UnrealVersionSelector -register -unattended`. Budget 30+ GB.
-4. Wwise 2025.1.6.9117 via wwise-cli, integrate, create the Wwise project, generate soundbanks.
-5. Clone the Starter Project (`satisfactorymodding/SatisfactoryModLoader`). Open it in Rider
-   (install the "Unreal Project Model Mods Fix" plugin) or VS Code, build `FactoryEditor` for
-   Linux Development, open `FactoryGame.uproject`.
-6. In the editor, Alpakit Dev -> Create Mod -> template **"C++ & Blueprint Library (Advanced)"**,
-   mod reference `SegmentedSplines`. Close the editor, then copy this folder's `Config/`,
-   `Source/` and `.uplugin` over the generated `Mods/SegmentedSplines/` (overwrite). Keep the
-   wizard's generated `Resources/Icon128.png` if it made one.
-7. Rebuild the editor target (Access Transformers only apply after a C++ build; if the generated
-   accessors do not appear, add or remove a `;` comment line in `AccessTransformers.ini`).
-8. Alpakit: set the game path to the Proton install, typically
-   `~/.local/share/Steam/steamapps/common/Satisfactory`, target **Windows**, and use Alpakit Dev
-   to copy the packaged mod straight into `FactoryGame/Mods/` there. Install SML into that game
-   install once with the native Linux Satisfactory Mod Manager.
+Install it with the [Satisfactory Mod Manager](https://smm.ficsit.app/) from the mod's page on
+[ficsit.app](https://ficsit.app/mod/SegmentedSplines). It needs SML 3.12 or newer and game
+build 520140 (1.2.6) or newer. Nothing needs to be installed on a server you join.
 
-## Test plan
+## How it works on vanilla servers
 
-1. Singleplayer: drag a Mk1 belt far past 56 m in curve mode. Expect: hologram turns valid, ends
-   at ~56 m along the curve, end pole sits under the new end. Build. Repeat for a pipe and a rail.
-2. Aim a long belt at a machine input: expect vanilla's red "too long" (snap case is excluded).
-3. The real proof: run the Linux dedicated server (Steam app 1690800) locally **without** SML,
-   join from the modded client, repeat test 1. If the belt appears for the server too, the
-   client-only design is confirmed.
-4. Watch the log for `LogSegmentedSplines` lines (set it to Verbose in `Engine.ini` to see the
-   per-cut messages).
+Only the server constructs buildings. The client serialises its local hologram into a
+construction message and the server re-validates it (length, slope, curvature, clearance, cost)
+before building. This mod only ever changes the *local* hologram, so that each message the client
+sends is a legal single piece. For a long spline it sends piece one, waits for the built piece to
+replicate back, snaps the next hologram to its end connector, sends that, and so on.
 
-## Things to verify in the editor that I could not verify from headers alone
+* `RequiredOnRemote` is `false` in the `.uplugin`. SML 3.9+ clients refuse to join a server that
+  lacks a mod marked required, which would lock you out of vanilla servers.
+* A client with SML can join a server without SML (SML 3.8+).
 
-* That the hypertube recipe's hologram class is `AFGPipelineHologram` (or a subclass of it).
-* That `CheckValidPlacement` is indeed called after routing every update (if the cut flickers,
-  move the hook to a post-hook on `PostHologramPlacement` instead; the helper is shared).
-* The exact end-pole behaviour on sloped ground (see KNOWN LIMITATION in the .cpp).
+The hooks are SML native hooks on `CheckValidPlacement`, `TrySnapToActor`,
+`SetHologramLocationAndRotation` and `DoMultiStepPlacement` of the belt, pipeline and railroad
+track hologram classes, plus the construction message serializer. Protected members are reached
+through `Config/AccessTransformers.ini`. [CLAUDE.md](CLAUDE.md) is the detailed engineering
+log: every run, every bug found and how each piece of the chain works.
 
-## Phase 2 sketch: chaining
+## Known limits
 
-Keep the same truncation helper, but on construct: compute the full long spline locally, split
-it with `SplitSplineAtDistance` into equal arc-length pieces each under the limit, send piece 1
-through the normal build path, wait for `Client_OnBuildableConstructed` / the new buildable to
-replicate, snap piece 2's start to its end connection, send, repeat. Needs a small client-side
-queue and a clean abort if the server rejects a piece (clearance, cost). Each piece is still a
-plain vanilla construction message, so the vanilla-server property is preserved.
+* The far end of a chain is placed by the game from your last cursor hit. Aiming at something that
+  the game itself refuses (for example two supports showing at once on a pillar) refuses the chain.
+* A chain is at most 32 pieces. Longer than that, the hologram stays vanilla's red "too long".
+* If the server rejects a piece, or a built piece does not replicate back within 60 seconds, the
+  chain stops and leaves what was built. The log says why.
+* The game's own bridge splines inside blueprints, and a train platform's track, are never
+  chained. A blueprint placed too far from its connections shows red exactly as in vanilla.
+
+## Building from source
+
+Follow the official guide for your platform
+(https://docs.ficsit.app/satisfactory-modding/latest/Development/BeginnersGuide/index.html).
+In short:
+
+1. Install the Coffee Stain custom engine (the `UnrealEngine-CSS-Editor-*` release that matches
+   the current game build) and the Satisfactory Mod Loader starter project
+   (`satisfactorymodding/SatisfactoryModLoader`). On Linux, the Win64 target needs MSVC through
+   msvc-wine (`UE_WINE_MSVC`) and Wine.
+2. Clone this repository into the starter project as `Mods/SegmentedSplines`. The folder name is
+   the mod reference and must not change.
+3. Build the `FactoryEditor` target once (the Access Transformers only take effect after a C++
+   build), then package with Alpakit: target **Windows**, Alpakit Dev to copy the mod into your
+   game's `FactoryGame/Mods/`, Alpakit Release to produce the zip for ficsit.app. The command-line
+   equivalents are recorded in [CLAUDE.md](CLAUDE.md).
+4. After every game update, compare the game log's `LogInit: Build:` changelist with the starter
+   project's headers and rebuild. A mismatch makes the mod read the wrong fields and chains fail
+   silently; the mod logs a warning when it detects this.
+
+Logging goes to the `LogSegmentedSplines` category. Chain steps log at Log level; set the
+category to Verbose in `Engine.ini` for every placement decision.
+
+## Author
+
+[krammark191](https://github.com/krammark191). Issues and suggestions:
+https://github.com/krammark191/SegmentedSplines/issues

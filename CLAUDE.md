@@ -107,6 +107,11 @@ session on the Linux (CachyOS) PC that will compile, test and continue it. Read 
   `SendNextPiece` sets the final pole's yaw back to it after `ApplyPiece` (fallback: the
   curve's arrival direction); a Verbose line logs which. Also added (user request): a length
   readout, see "Length readout" in the Phase 2 section.
+- **Release prep (2026-11-21).** Version 1.0.0 (SMR docs advise against 0.x for a first public
+  release), `CreatedBy` krammark191 with GitHub URLs, wireframe icon, README rewritten around
+  two screenshots and the demo video, SMR description drafted. The ficsit.app mod page and first
+  version upload are the user's own steps (sign in with GitHub, New Mod with reference
+  `SegmentedSplines`, then New Version with the merged zip); not done by Claude.
 - **Fifteenth run (2026-11-21):** readout seen and liked ("bump its font size up a little":
   now 2 % of the camera distance, 35-500 cm). Belt and track final supports fine; pipe and
   hypertube final supports "not off angle this time, but offset" (both chains built, the log
@@ -407,5 +412,14 @@ Docs (docs.ficsit.app/satisfactory-modding/latest/...):
   headers in step with the installed game (see the 2026-11-21 status entry).
 - Keep `RequiredOnRemote: false`. Keep `Config/Alpakit.ini` targets to `Windows` only (the Proton
   game is the Windows build; Linux docs note Wine is needed to build the Win64 target).
-- `Resources/Icon128.png` is still missing; needed before an SMR upload.
+- `Resources/Icon128.png` is generated from `docs/icon/icon.svg` (`rsvg-convert -w 128 -h 128`;
+  `docs/icon/icon-512.png` is the same picture for the ficsit.app logo field). Re-run that when
+  the SVG changes.
+- Release zip for ficsit.app: the Alpakit Dev command line plus `-merge` (Alpakit Release does
+  exactly that; `PackagePlugin.cs` `ArchiveMergedStagedPlugin`), written to
+  `<starter>/Saved/ArchivedPlugins/SegmentedSplines/SegmentedSplines.zip`. Upload that zip (not
+  the per-target `SegmentedSplines-Windows.zip`). Bump `Version` (major), `VersionName` and
+  `SemVersion` together for every upload; SMR requires VersionName == SemVersion.
+- `docs/media/` holds the README screenshots and the 720p demo video; `docs/smr-description.md`
+  is the ficsit.app full-description markdown (images by raw GitHub URL).
 - Build artifacts (`Binaries/`, `Intermediate/`, `Saved/`) are gitignored.
